@@ -15,13 +15,32 @@ SmolCrawl has evolved into a comprehensive document processing toolkit centered 
 
 Perfect for creating unified documentation from large API references, technical documentation sites, and knowledge bases.
 
-## 🚀 Quick Start with Unified Tool
+## 🚀 Quick Start with Batch Tool
 
-The project now centers around the `doc_processor.py` tool (located in `use-cases/document-processing/`) - a powerful, configurable tool that replaces multiple specialized scripts:
+For **non-technical users**, SmolCrawl provides a simple interactive batch file:
+
+```batch
+# Windows users - just double-click or run:
+smolcrawl.bat
+```
+
+The batch file will prompt you for:
+- **Project name** (e.g., "my-docs")
+- **Website URL** (e.g., "http://localhost:1313")
+- **Server intensity** (0.0-1.0, controls crawling aggressiveness)
+
+Then it runs the complete pipeline automatically!
+
+### Advanced Usage with Unified Tool
+
+For advanced users, the project centers around the `doc_processor.py` tool with **server intensity control**:
 
 ```bash
 # Create a new organized use case
 python use-cases/document-processing/doc_processor.py create-use-case --name my-docs --base-url http://localhost:8080
+
+# Run with server intensity control (0.0=gentle, 1.0=aggressive)
+python use-cases/document-processing/doc_processor.py full-pipeline --config use-cases/my-docs/config.json --server-intensity 0.3
 
 # Run complete processing pipeline
 python use-cases/document-processing/doc_processor.py full-pipeline --config use-cases/my-docs/config.json
@@ -30,13 +49,15 @@ python use-cases/document-processing/doc_processor.py full-pipeline --config use
 ## Core Features
 
 ### Universal Document Processor (`use-cases/document-processing/doc_processor.py`)
-- **Multi-mode Operation**: `extract`, `merge`, `full-pipeline`, `create-config`, `create-use-case`
+- **Multi-mode Operation**: `extract`, `merge`, `full-pipeline`, `create-config`, `create-use-case`, `discover-urls`
+- **Server Intensity Control**: 0.0-1.0 scale for crawling aggressiveness (auto-configures workers, delays, timeouts)
 - **High Performance**: Multi-threaded processing with real-time progress tracking
 - **Flexible Input**: URL lists, configuration files, or command-line parameters
 - **Smart Categorization**: Automatic document organization by category
 - **Content Cleaning**: Intelligent content extraction and markdown conversion
 - **Comprehensive Output**: Individual files plus merged documentation with table of contents
 - **Organized Structure**: Automated use case creation with consistent folder structure
+- **Windows Batch Integration**: Simple `smolcrawl.bat` for non-technical users
 
 ### Configuration Management
 - **JSON Configuration**: Production-ready configuration files
@@ -78,12 +99,18 @@ pip install -e .
 # Extract using configuration file
 python use-cases/document-processing/doc_processor.py extract --config config_unreal.json
 
-# Extract with command-line options
+# Extract with command-line options and server intensity
 python use-cases/document-processing/doc_processor.py extract \
   --base-url "http://localhost:8080" \
   --urls-file "discovered_urls.txt" \
   --output-dir "output/docs" \
-  --max-workers 8
+  --max-workers 8 \
+  --server-intensity 0.5
+
+# Discover URLs from a website
+python use-cases/document-processing/doc_processor.py discover-urls \
+  --base-url "http://localhost:1313" \
+  --save-urls "discovered_urls.txt"
 ```
 
 ### Merge Extracted Documents
@@ -128,6 +155,7 @@ python use-cases/document-processing/migrate_to_doc_processor.py
   "url_list_file": "discovered_urls.txt",
   "max_workers": 6,
   "timeout": 15,
+  "server_intensity": 0.3,
   "output_dir": "output/extracted_docs",
   "merge_output": "merged_documentation.md",
   "categories": ["Runtime", "Editor", "Plugins", "Other"],
@@ -145,6 +173,7 @@ python use-cases/document-processing/migrate_to_doc_processor.py
 base_url: "http://localhost:8080"
 url_list_file: "discovered_urls.txt"
 max_workers: 6
+server_intensity: 0.3
 output_dir: "output/extracted_docs"
 merge_output: "merged_documentation.md"
 categories:
@@ -300,17 +329,32 @@ python use-cases/document-processing/doc_processor.py --help
 # Create organized use case structure (recommended)
 python use-cases/document-processing/doc_processor.py create-use-case --name project-docs --base-url http://localhost:8080
 
+# Discover URLs from website
+python use-cases/document-processing/doc_processor.py discover-urls --base-url http://localhost:1313 --save-urls discovered_urls.txt
+
 # Create configuration template (legacy)
 python use-cases/document-processing/doc_processor.py create-config
 
-# Extract documents only
-python use-cases/document-processing/doc_processor.py extract --config use-cases/project-docs/config.json
+# Extract documents with server intensity control
+python use-cases/document-processing/doc_processor.py extract --config use-cases/project-docs/config.json --server-intensity 0.3
 
 # Merge existing documents
 python use-cases/document-processing/doc_processor.py merge --input-dir output/docs --merge-output final.md
 
 # Complete pipeline (extract + merge)
 python use-cases/document-processing/doc_processor.py full-pipeline --config use-cases/project-docs/config.json
+```
+
+### Windows Batch Tool
+```batch
+# Interactive batch file for non-technical users
+smolcrawl.bat
+
+# The batch file prompts for:
+# - Project name
+# - Website URL  
+# - Server intensity (0.0-1.0 scale)
+# Then runs the complete pipeline automatically
 ```
 
 ### Testing & Validation
