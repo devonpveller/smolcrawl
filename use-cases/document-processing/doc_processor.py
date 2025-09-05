@@ -325,16 +325,20 @@ class DocumentProcessor:
     
     def save_discovered_urls(self, urls: List[str], filename: str = "discovered_urls.txt") -> str:
         """Save discovered URLs to a file"""
-        # Determine use case directory from base URL
-        from urllib.parse import urlparse
-        parsed = urlparse(self.config.base_url)
-        use_case_name = f"{parsed.hostname}-{parsed.port}" if parsed.port else parsed.hostname
-        use_case_dir = Path("use-cases") / use_case_name
-        
-        if use_case_dir.exists():
-            file_path = use_case_dir / filename
-        else:
+        # If filename is a full path, use it directly
+        if Path(filename).is_absolute() or '/' in filename or '\\' in filename:
             file_path = Path(filename)
+        else:
+            # Determine use case directory from base URL
+            from urllib.parse import urlparse
+            parsed = urlparse(self.config.base_url)
+            use_case_name = f"{parsed.hostname}-{parsed.port}" if parsed.port else parsed.hostname
+            use_case_dir = Path("use-cases") / use_case_name
+            
+            if use_case_dir.exists():
+                file_path = use_case_dir / filename
+            else:
+                file_path = Path(filename)
         
         # Ensure directory exists
         file_path.parent.mkdir(parents=True, exist_ok=True)
