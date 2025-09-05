@@ -21,6 +21,7 @@ import requests
 import os
 import time
 import re
+import asyncio
 from pathlib import Path
 from urllib.parse import urljoin, urlparse
 from typing import List, Tuple, Dict, Any, Optional
@@ -42,6 +43,18 @@ try:
 except ImportError:
     print("Warning: markdownify not available. Install with: pip install markdownify")
     markdownify = None
+
+# Import SmolCrawl functionality for URL discovery
+try:
+    import sys
+    sys.path.append('../../src')
+    from smolcrawl.crawl import crawl_target
+    from smolcrawl.db import Page
+    CRAWL_AVAILABLE = True
+except ImportError:
+    print("Warning: SmolCrawl crawling not available. URL discovery will be limited.")
+    CRAWL_AVAILABLE = False
+    Page = None
 
 @dataclass
 class ProcessingConfig:
@@ -113,6 +126,11 @@ class DocumentProcessor:
     def clean_filename(self, url: str) -> str:
         """Convert URL to safe filename"""
         clean = url.replace(self.config.base_url, '').strip('/')
+        
+        # Handle homepage/empty path
+        if not clean:
+            clean = "index"
+        
         clean = clean.replace('/', '_').replace(':', '').replace('?', '_').replace('#', '_')
         clean = re.sub(r'[<>:"|*]', '', clean)  # Remove Windows-unsafe chars
         
@@ -186,7 +204,7 @@ class DocumentProcessor:
             
             # Create category directory
             category_dir = self.output_dir / result['category']
-            category_dir.mkdir(exist_ok=True)
+            category_dir.mkdir(parents=True, exist_ok=True)
             
             # Save to file
             filename = self.clean_filename(url)
@@ -253,6 +271,80 @@ class DocumentProcessor:
                 if line and not line.startswith('#'):
                     urls.append(line)
         return urls
+    
+    async def discover_urls(self, base_url: Optional[str] = None) -> List[str]:
+        """Discover URLs using SmolCrawl's automatic crawling"""
+        if not CRAWL_AVAILABLE:
+            print("❌ SmolCrawl crawling not available. Using basic URL discovery.")
+            return self._basic_url_discovery(base_url or self.config.base_url)
+        
+        target_url = base_url or self.config.base_url
+        print(f"🔍 Discovering URLs from {target_url}")
+        
+        try:
+            # Use SmolCrawl's crawling functionality
+            pages = await crawl_target(target_url)
+            urls = [page.url for page in pages]
+            
+            print(f"✅ Discovered {len(urls)} URLs")
+            return urls
+            
+        except Exception as e:
+            print(f"❌ Error during URL discovery: {e}")
+            print("📋 Falling back to basic URL discovery...")
+            return self._basic_url_discovery(target_url)
+    
+    def _basic_url_discovery(self, base_url: str) -> List[str]:
+        """Basic URL discovery by parsing links from homepage"""
+        try:
+            import requests
+            from bs4 import BeautifulSoup
+            
+            response = requests.get(base_url, timeout=self.config.timeout)
+            response.raise_for_status()
+            
+            soup = BeautifulSoup(response.content, 'html.parser')
+            links = soup.find_all('a', href=True)
+            
+            urls = set([base_url])  # Include the base URL
+            for link in links:
+                href = link['href']
+                if href.startswith('/') and not href.startswith('//'):
+                    full_url = urljoin(base_url, href)
+                    # Filter out common non-content URLs
+                    if not any(skip in href.lower() for skip in ['#', 'javascript:', 'mailto:', '.css', '.js', '.png', '.jpg', '.gif']):
+                        urls.add(full_url)
+            
+            urls_list = sorted(list(urls))
+            print(f"📋 Basic discovery found {len(urls_list)} URLs")
+            return urls_list
+            
+        except Exception as e:
+            print(f"❌ Basic URL discovery failed: {e}")
+            return [base_url]  # Return at least the base URL
+    
+    def save_discovered_urls(self, urls: List[str], filename: str = "discovered_urls.txt") -> str:
+        """Save discovered URLs to a file"""
+        # Determine use case directory from base URL
+        from urllib.parse import urlparse
+        parsed = urlparse(self.config.base_url)
+        use_case_name = f"{parsed.hostname}-{parsed.port}" if parsed.port else parsed.hostname
+        use_case_dir = Path("use-cases") / use_case_name
+        
+        if use_case_dir.exists():
+            file_path = use_case_dir / filename
+        else:
+            file_path = Path(filename)
+        
+        # Ensure directory exists
+        file_path.parent.mkdir(parents=True, exist_ok=True)
+        
+        with open(file_path, 'w', encoding='utf-8') as f:
+            for url in urls:
+                f.write(f"{url}\n")
+        
+        print(f"💾 Saved {len(urls)} URLs to {file_path}")
+        return str(file_path)
     
     def extract_documents(self, urls: Optional[List[str]] = None) -> Dict[str, Any]:
         """Extract documents from URLs with multi-threading"""
@@ -581,16 +673,22 @@ Extracts, processes, and merges web documentation from {base_url} into clean mar
 
 ### Quick Start
 ```bash
+# Discover all URLs automatically (recommended first step)
+python use-cases/document-processing/doc_processor.py discover-urls --base-url {base_url} --save-urls use-cases/{name}/discovered_urls.txt
+
 # Run complete processing pipeline
 python use-cases/document-processing/doc_processor.py full-pipeline --config use-cases/{name}/config.json
 ```
 
 ### Step-by-Step Processing
 ```bash
-# Extract documents only
+# 1. Discover URLs (automatic crawling)
+python use-cases/document-processing/doc_processor.py discover-urls --base-url {base_url} --save-urls use-cases/{name}/discovered_urls.txt
+
+# 2. Extract documents only
 python use-cases/document-processing/doc_processor.py extract --config use-cases/{name}/config.json
 
-# Merge extracted documents
+# 3. Merge extracted documents
 python use-cases/document-processing/doc_processor.py merge --config use-cases/{name}/config.json
 ```
 
@@ -649,7 +747,7 @@ Expected processing rate: ~4-6 URLs per second with 6 worker threads on localhos
 
 def main():
     parser = argparse.ArgumentParser(description="Universal Document Processing Tool")
-    parser.add_argument('command', choices=['extract', 'merge', 'full-pipeline', 'create-config', 'create-use-case'],
+    parser.add_argument('command', choices=['extract', 'merge', 'full-pipeline', 'create-config', 'create-use-case', 'discover-urls'],
                        help='Command to execute')
     
     # Configuration
@@ -663,6 +761,9 @@ def main():
     # Use case creation options
     parser.add_argument('--name', help='Name for new use case (required for create-use-case)')
     parser.add_argument('--categories', nargs='+', help='Categories for use case (space-separated)')
+    
+    # URL discovery options
+    parser.add_argument('--save-urls', help='Save discovered URLs to file (default: discovered_urls.txt)')
     
     # Processing options
     parser.add_argument('--input-dir', help='Input directory for merge operation')
@@ -686,6 +787,21 @@ def main():
             base_url=args.base_url,
             categories=args.categories
         )
+        return
+    
+    if args.command == 'discover-urls':
+        # Create a minimal processor for URL discovery
+        config = ProcessingConfig(base_url=args.base_url)
+        processor = DocumentProcessor(config)
+        
+        # Run URL discovery
+        try:
+            urls = asyncio.run(processor.discover_urls(args.base_url))
+            filename = args.save_urls or "discovered_urls.txt"
+            processor.save_discovered_urls(urls, filename)
+            print(f"🎉 URL discovery completed! Found {len(urls)} URLs")
+        except Exception as e:
+            print(f"❌ URL discovery failed: {e}")
         return
     
     # Load or create configuration
