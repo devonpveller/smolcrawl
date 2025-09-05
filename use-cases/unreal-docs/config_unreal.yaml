@@ -1,0 +1,37 @@
+# Universal Document Processor Configuration
+# YAML format example
+
+# Source configuration
+base_url: "http://localhost:8080"
+url_list_file: "discovered_urls.txt"
+start_urls: null
+
+# Processing settings
+max_workers: 6
+max_retries: 3
+timeout: 15
+delay_between_requests: 0.1
+
+# Output configuration
+output_dir: "output/extracted_docs"
+merge_output: "merged_documentation.md"
+
+# Content organization
+categories:
+  - "Runtime"
+  - "Editor" 
+  - "Plugins"
+  - "Other"
+
+category_order:
+  - "Runtime"
+  - "Editor"
+  - "Plugins"
+  - "Other"
+
+# Processing options
+clean_content: true
+add_metadata: true
+use_readability: true
+convert_to_markdown: true
+include_toc: true

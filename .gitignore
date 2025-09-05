@@ -13,3 +13,4 @@ repomix-output.*
 dist/
 smolcrawl-data/
 blog/
+output/

@@ -1,0 +1,32 @@
+{
+  "base_url": "http://localhost:8081",
+  "url_list_file": "blueprint_api_urls.txt",
+  "max_workers": 12,
+  "timeout": 15,
+  "delay_between_requests": 0.01,
+  "output_dir": "output/blueprint_api_docs",
+  "merge_output": "UE54_Blueprint_API_Complete_Documentation.md",
+  "categories": [
+    "Classes",
+    "Functions",
+    "Components",
+    "Interfaces",
+    "Enums",
+    "Structs",
+    "Other"
+  ],
+  "category_order": [
+    "Classes",
+    "Functions",
+    "Components",
+    "Interfaces",
+    "Enums",
+    "Structs",
+    "Other"
+  ],
+  "clean_content": true,
+  "add_metadata": true,
+  "use_readability": true,
+  "convert_to_markdown": true,
+  "include_toc": true
+}
