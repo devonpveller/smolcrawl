@@ -6,8 +6,9 @@
     ],
     "max_workers": 6,
     "max_retries": 3,
-    "timeout": 15,
-    "delay_between_requests": 0.1,
+    "timeout": 20,
+    "delay_between_requests": 1.0,
+    "server_intensity": 0.5,
     "output_dir": "output/docker-docs",
     "merge_output": "output/docker-docs/merged_documentation.md",
     "categories": [

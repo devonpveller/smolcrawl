@@ -69,6 +69,7 @@ class ProcessingConfig:
     max_retries: int = 3
     timeout: int = 15
     delay_between_requests: float = 0.1
+    server_intensity: float = 0.5  # 0.0 = gentle, 1.0 = aggressive
     
     # Output settings
     output_dir: str = "output/extracted_docs"
@@ -90,6 +91,27 @@ class ProcessingConfig:
             self.categories = ['Other', 'Runtime', 'Editor', 'Plugins']
         if self.category_order is None:
             self.category_order = self.categories.copy()
+        
+        # Auto-calculate settings based on server_intensity
+        self._apply_server_intensity()
+    
+    def _apply_server_intensity(self):
+        """Automatically adjust settings based on server_intensity (0.0-1.0)"""
+        # Clamp intensity to valid range
+        intensity = max(0.0, min(1.0, self.server_intensity))
+        
+        # Calculate optimal settings based on intensity
+        # Max workers: 1-12 workers based on intensity
+        self.max_workers = max(1, int(1 + (intensity * 11)))
+        
+        # Delay between requests: 2.0s (gentle) to 0.0s (aggressive)
+        self.delay_between_requests = (1.0 - intensity) * 2.0
+        
+        # Timeout: 30s (gentle) to 10s (aggressive)
+        self.timeout = int(30 - (intensity * 20))
+        
+        # Max retries: 5 (gentle) to 2 (aggressive)
+        self.max_retries = int(5 - (intensity * 3))
 
 class DocumentProcessor:
     """Universal document processing and merging tool"""
@@ -98,6 +120,13 @@ class DocumentProcessor:
         self.config = config
         self.output_dir = Path(config.output_dir)
         self.output_dir.mkdir(parents=True, exist_ok=True)
+        
+        # Show auto-calculated settings if intensity was used
+        if hasattr(config, 'server_intensity'):
+            print(f"🎛️ Server intensity: {config.server_intensity:.1f} "
+                  f"(workers: {config.max_workers}, "
+                  f"delay: {config.delay_between_requests:.1f}s, "
+                  f"timeout: {config.timeout}s)")
         
         # Thread-safe counters
         self.lock = threading.Lock()
@@ -619,6 +648,7 @@ def create_sample_config(output_path: str = "doc_processor_config.json"):
         output_dir="output/extracted_docs",
         merge_output="merged_documentation.md",
         max_workers=6,
+        server_intensity=0.5,
         categories=['Other', 'Runtime', 'Editor', 'Plugins'],
         category_order=['Other', 'Runtime', 'Editor', 'Plugins']
     )
@@ -649,6 +679,7 @@ def create_use_case(name: str, base_url: str = "http://localhost:8080", categori
         output_dir=f"output/{name}",
         merge_output=f"output/{name}/merged_documentation.md",
         max_workers=6,
+        server_intensity=0.5,
         categories=categories,
         category_order=categories
     )
@@ -761,6 +792,8 @@ def main():
     parser.add_argument('--output-dir', default='output/extracted_docs', help='Output directory')
     parser.add_argument('--merge-output', default='merged_documentation.md', help='Merged output file')
     parser.add_argument('--max-workers', type=int, default=6, help='Number of worker threads')
+    parser.add_argument('--server-intensity', type=float, default=0.5, 
+                       help='Server intensity 0.0-1.0: 0=gentle/slow, 1=aggressive/fast')
     
     # Use case creation options
     parser.add_argument('--name', help='Name for new use case (required for create-use-case)')
@@ -818,6 +851,7 @@ def main():
             output_dir=args.output_dir,
             merge_output=args.merge_output,
             max_workers=args.max_workers,
+            server_intensity=args.server_intensity,
             include_toc=not args.no_toc,
             clean_content=not args.no_clean
         )

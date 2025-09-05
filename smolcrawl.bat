@@ -28,12 +28,23 @@ if "%WEBSITE_URL%"=="" (
     exit /b 1
 )
 
+REM Get server intensity from user
+echo.
+echo Server Intensity (how hard to hit the server):
+echo   0.0 = Gentle  (1 worker, 2s delay, long timeout - slow but respectful)
+echo   0.5 = Balanced (6 workers, 1s delay, medium timeout - recommended)
+echo   1.0 = Aggressive (12 workers, no delay, short timeout - fast but intensive)
+echo.
+set /p SERVER_INTENSITY="Enter server intensity (0.0-1.0, default 0.3): "
+if "%SERVER_INTENSITY%"=="" set SERVER_INTENSITY=0.3
+
 echo.
 echo ================================
 echo Starting SmolCrawl Process
 echo ================================
 echo Project Name: %PROJECT_NAME%
 echo Website URL: %WEBSITE_URL%
+echo Server Intensity: %SERVER_INTENSITY%
 echo.
 echo This will create:
 echo   - use-cases\%PROJECT_NAME%\ (configuration and URLs)
@@ -71,8 +82,8 @@ echo [2/3] URLs discovered successfully!
 
 echo.
 echo [3/3] Processing documents (this may take several minutes)...
-echo     Using conservative settings for localhost processing...
-call python use-cases\document-processing\doc_processor.py extract --base-url "%WEBSITE_URL%" --urls-file "use-cases\%PROJECT_NAME%\discovered_urls.txt" --output-dir "output\%PROJECT_NAME%" --max-workers 2
+echo     Using server intensity %SERVER_INTENSITY% (auto-configured settings)...
+call python use-cases\document-processing\doc_processor.py extract --base-url "%WEBSITE_URL%" --urls-file "use-cases\%PROJECT_NAME%\discovered_urls.txt" --output-dir "output\%PROJECT_NAME%" --server-intensity %SERVER_INTENSITY%
 if not %errorlevel%==0 (
     echo X Failed to extract documents
     echo Press any key to exit...
