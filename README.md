@@ -17,19 +17,19 @@ Perfect for creating unified documentation from large API references, technical 
 
 ## 🚀 Quick Start with Unified Tool
 
-The project now centers around `doc_processor.py` - a powerful, configurable tool that replaces multiple specialized scripts:
+The project now centers around the `doc_processor.py` tool (located in `use-cases/document-processing/`) - a powerful, configurable tool that replaces multiple specialized scripts:
 
 ```bash
 # Create configuration
-python doc_processor.py create-config
+python use-cases/document-processing/doc_processor.py create-config
 
 # Run complete processing pipeline
-python doc_processor.py full-pipeline --config config.json
+python use-cases/document-processing/doc_processor.py full-pipeline --config config.json
 ```
 
 ## Core Features
 
-### Universal Document Processor (`doc_processor.py`)
+### Universal Document Processor (`use-cases/document-processing/doc_processor.py`)
 - **Multi-mode Operation**: `extract`, `merge`, `full-pipeline`, `create-config`
 - **High Performance**: Multi-threaded processing with real-time progress tracking
 - **Flexible Input**: URL lists, configuration files, or command-line parameters
@@ -75,10 +75,10 @@ pip install -e .
 ### Extract Documents from URLs
 ```bash
 # Extract using configuration file
-python doc_processor.py extract --config config_unreal.json
+python use-cases/document-processing/doc_processor.py extract --config config_unreal.json
 
 # Extract with command-line options
-python doc_processor.py extract \
+python use-cases/document-processing/doc_processor.py extract \
   --base-url "http://localhost:8080" \
   --urls-file "discovered_urls.txt" \
   --output-dir "output/docs" \
@@ -88,10 +88,10 @@ python doc_processor.py extract \
 ### Merge Extracted Documents
 ```bash
 # Merge using configuration
-python doc_processor.py merge --config config_unreal.json
+python use-cases/document-processing/doc_processor.py merge --config config_unreal.json
 
 # Merge with custom options
-python doc_processor.py merge \
+python use-cases/document-processing/doc_processor.py merge \
   --input-dir "output/docs" \
   --merge-output "Complete_Documentation.md" \
   --title "Project Documentation"
@@ -100,19 +100,19 @@ python doc_processor.py merge \
 ### Complete Processing Pipeline
 ```bash
 # Run extraction and merge in one command
-python doc_processor.py full-pipeline --config config_unreal.json
+python use-cases/document-processing/doc_processor.py full-pipeline --config config_unreal.json
 ```
 
 ### Configuration Management
 ```bash
 # Create sample configuration
-python doc_processor.py create-config
+python use-cases/document-processing/doc_processor.py create-config
 
 # Test configuration and functionality
-python test_doc_processor.py
+python tests/test_doc_processor.py
 
 # Migrate from old specialized scripts
-python migrate_to_doc_processor.py
+python use-cases/document-processing/migrate_to_doc_processor.py
 ```
 
 ## Configuration
@@ -161,32 +161,57 @@ include_toc: true
 
 ```
 smolcrawl/
-├── 🚀 CORE TOOLS
-│   ├── doc_processor.py              # Universal document processor (22.8KB)
-│   ├── test_doc_processor.py         # Comprehensive test suite (4.4KB)
-│   └── migrate_to_doc_processor.py   # Migration utility (7.8KB)
+├── � CORE FRAMEWORK
+│   ├── src/smolcrawl/                # Original SmolCrawl source code
+│   │   ├── __init__.py              # CLI definitions
+│   │   ├── crawl.py                 # Web crawling functionality
+│   │   ├── db.py                    # Database operations
+│   │   └── utils.py                 # Utility functions
+│   ├── pyproject.toml               # Project configuration
+│   ├── uv.lock                     # Dependencies lock file
+│   └── README.md                    # This file
 │
-├── ⚙️ CONFIGURATION
-│   ├── config_unreal.json            # JSON config for Unreal Engine docs
-│   ├── config_unreal.yaml            # YAML configuration example
-│   └── doc_processor_config.json     # Sample configuration template
+├── 🧪 TESTS
+│   ├── tests/                       # All test files
+│   │   ├── test_doc_processor.py    # Document processor tests
+│   │   ├── test_http_server.py      # HTTP server tests
+│   │   ├── test_manual_crawl.py     # Manual crawling tests
+│   │   ├── test_readability.py      # Readability extraction tests
+│   │   ├── test_merge/              # Merge operation test data
+│   │   └── README.md               # Test documentation
 │
 ├── 📚 DOCUMENTATION
-│   ├── DOC_PROCESSOR_README.md       # Complete usage guide (9.1KB)
-│   ├── PROJECT_STATUS.md             # Current project overview
-│   ├── UNIFICATION_COMPLETE.md       # Consolidation summary
-│   └── README.md                     # This file
+│   ├── docs/                        # All project documentation
+│   │   ├── DOC_PROCESSOR_README.md  # Document processor guide
+│   │   ├── PROJECT_STATUS.md        # Current project status
+│   │   ├── BLUEPRINT_API_*.md       # Blueprint API documentation
+│   │   ├── UE54_Blueprint_API_Complete_Documentation.md
+│   │   └── *.md                    # Various project documentation
 │
-├── 🔧 UTILITIES
-│   ├── check_cache.py                # Cache debugging utility
-│   └── readabilipy_windows_fix.py    # Windows compatibility fix
-│
-├── 📦 ORIGINAL SMOLCRAWL
-│   └── src/smolcrawl/               # Original SmolCrawl source code
-│       ├── __init__.py              # CLI definitions
-│       ├── crawl.py                 # Web crawling functionality
-│       ├── db.py                    # Database operations
-│       └── utils.py                 # Utility functions
+├── 🎯 USE CASES
+│   ├── use-cases/blueprint-api/     # Blueprint API processing
+│   │   ├── blueprint_api_assistant.py
+│   │   ├── process_blueprint_api.py
+│   │   ├── discover_blueprint_urls*.py
+│   │   ├── config_blueprint_api.json
+│   │   ├── *.bat                   # Windows batch scripts
+│   │   └── README.md               # Blueprint API documentation
+│   │
+│   ├── use-cases/document-processing/ # General document processing
+│   │   ├── doc_processor.py         # Universal document processor
+│   │   ├── batch_processor.py       # Batch processing tools
+│   │   ├── complete_extractor.py    # Complete extraction pipeline
+│   │   ├── migrate_to_doc_processor.py
+│   │   ├── monitor_progress.py      # Progress monitoring
+│   │   ├── readabilipy_windows_fix.py
+│   │   ├── doc_processor_config.json
+│   │   └── README.md               # Document processing guide
+│   │
+│   └── use-cases/unreal-docs/       # Unreal Engine documentation
+│       ├── merge_unreal_docs.py     # Unreal docs merging
+│       ├── config_unreal.json       # Unreal config (JSON)
+│       ├── config_unreal.yaml       # Unreal config (YAML)
+│       └── README.md               # Unreal docs guide
 │
 └── 💾 DATA & OUTPUT
     ├── output/                      # Document processing output
@@ -239,15 +264,15 @@ If you were using the previous specialized scripts, migration is straightforward
 ### Old Scripts → New Unified Tool
 | Old Command | New Command |
 |-------------|-------------|
-| `python complete_extractor.py` | `python doc_processor.py extract --config config.json` |
-| `python merge_unreal_docs.py` | `python doc_processor.py merge --config config.json` |
-| `python batch_processor.py` | `python doc_processor.py full-pipeline --config config.json` |
+| `python complete_extractor.py` | `python use-cases/document-processing/doc_processor.py extract --config config.json` |
+| `python merge_unreal_docs.py` | `python use-cases/unreal-docs/merge_unreal_docs.py` or `python use-cases/document-processing/doc_processor.py merge --config config.json` |
+| `python batch_processor.py` | `python use-cases/document-processing/doc_processor.py full-pipeline --config config.json` |
 
 ### Migration Steps
-1. **Run migration utility**: `python migrate_to_doc_processor.py`
+1. **Run migration utility**: `python use-cases/document-processing/migrate_to_doc_processor.py`
 2. **Review generated config**: Edit `migrated_config.json` as needed
-3. **Test functionality**: `python test_doc_processor.py` 
-4. **Execute unified tool**: `python doc_processor.py full-pipeline --config migrated_config.json`
+3. **Test functionality**: `python tests/test_doc_processor.py` 
+4. **Execute unified tool**: `python use-cases/document-processing/doc_processor.py full-pipeline --config migrated_config.json`
 
 ## Original SmolCrawl Features
 
@@ -259,38 +284,38 @@ python -m smolcrawl crawl https://example.com
 python -m smolcrawl index https://example.com my_index
 ```
 
-However, the **recommended approach** is to use the unified `doc_processor.py` tool for all new document processing tasks.
+However, the **recommended approach** is to use the unified `use-cases/document-processing/doc_processor.py` tool for all new document processing tasks.
 
 ## Command Reference
 
 ### Universal Document Processor Commands
 ```bash
 # Show help
-python doc_processor.py --help
+python use-cases/document-processing/doc_processor.py --help
 
 # Create configuration template
-python doc_processor.py create-config
+python use-cases/document-processing/doc_processor.py create-config
 
 # Extract documents only
-python doc_processor.py extract --config config.json
+python use-cases/document-processing/doc_processor.py extract --config config.json
 
 # Merge existing documents
-python doc_processor.py merge --input-dir output/docs --merge-output final.md
+python use-cases/document-processing/doc_processor.py merge --input-dir output/docs --merge-output final.md
 
 # Complete pipeline (extract + merge)
-python doc_processor.py full-pipeline --config config.json
+python use-cases/document-processing/doc_processor.py full-pipeline --config config.json
 ```
 
 ### Testing & Validation
 ```bash
 # Run comprehensive test suite
-python test_doc_processor.py
+python tests/test_doc_processor.py
 
 # Check cache contents (debugging)
-python check_cache.py
+python use-cases/document-processing/check_cache.py
 
 # Migration assistance
-python migrate_to_doc_processor.py
+python use-cases/document-processing/migrate_to_doc_processor.py
 ```
 
 ## License
@@ -313,11 +338,11 @@ pip install requests readabilipy markdownify pyyaml
 ### Testing
 ```bash
 # Run the test suite
-python test_doc_processor.py
+python tests/test_doc_processor.py
 
 # Test specific functionality
-python doc_processor.py create-config
-python doc_processor.py --help
+python use-cases/document-processing/doc_processor.py create-config
+python use-cases/document-processing/doc_processor.py --help
 ```
 
 ### Areas for Contribution
@@ -346,11 +371,11 @@ python doc_processor.py --help
 - ✅ **Performance Proven**: Successfully processed 3,995+ documents
 
 ### Key Files
-- **`doc_processor.py`** - Universal document processing tool (22.8KB)
-- **`DOC_PROCESSOR_README.md`** - Complete usage documentation (9.1KB)
-- **`config_unreal.json`** - Production configuration example
-- **`test_doc_processor.py`** - Comprehensive test suite
-- **`PROJECT_STATUS.md`** - Detailed project overview
+- **`use-cases/document-processing/doc_processor.py`** - Universal document processing tool
+- **`docs/DOC_PROCESSOR_README.md`** - Complete usage documentation
+- **`use-cases/unreal-docs/config_unreal.json`** - Production configuration example
+- **`tests/test_doc_processor.py`** - Comprehensive test suite
+- **`docs/PROJECT_STATUS.md`** - Detailed project overview
 
 The project has evolved from basic web crawling to a comprehensive, production-ready document processing toolkit suitable for large-scale documentation extraction and organization.
 
