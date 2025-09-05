@@ -20,22 +20,23 @@ Perfect for creating unified documentation from large API references, technical 
 The project now centers around the `doc_processor.py` tool (located in `use-cases/document-processing/`) - a powerful, configurable tool that replaces multiple specialized scripts:
 
 ```bash
-# Create configuration
-python use-cases/document-processing/doc_processor.py create-config
+# Create a new organized use case
+python use-cases/document-processing/doc_processor.py create-use-case --name my-docs --base-url http://localhost:8080
 
 # Run complete processing pipeline
-python use-cases/document-processing/doc_processor.py full-pipeline --config config.json
+python use-cases/document-processing/doc_processor.py full-pipeline --config use-cases/my-docs/config.json
 ```
 
 ## Core Features
 
 ### Universal Document Processor (`use-cases/document-processing/doc_processor.py`)
-- **Multi-mode Operation**: `extract`, `merge`, `full-pipeline`, `create-config`
+- **Multi-mode Operation**: `extract`, `merge`, `full-pipeline`, `create-config`, `create-use-case`
 - **High Performance**: Multi-threaded processing with real-time progress tracking
 - **Flexible Input**: URL lists, configuration files, or command-line parameters
 - **Smart Categorization**: Automatic document organization by category
 - **Content Cleaning**: Intelligent content extraction and markdown conversion
 - **Comprehensive Output**: Individual files plus merged documentation with table of contents
+- **Organized Structure**: Automated use case creation with consistent folder structure
 
 ### Configuration Management
 - **JSON Configuration**: Production-ready configuration files
@@ -105,7 +106,10 @@ python use-cases/document-processing/doc_processor.py full-pipeline --config con
 
 ### Configuration Management
 ```bash
-# Create sample configuration
+# Create a complete use case with organized structure
+python use-cases/document-processing/doc_processor.py create-use-case --name localhost-docs --base-url http://localhost:8080
+
+# Create sample configuration (legacy method)
 python use-cases/document-processing/doc_processor.py create-config
 
 # Test configuration and functionality
@@ -293,17 +297,20 @@ However, the **recommended approach** is to use the unified `use-cases/document-
 # Show help
 python use-cases/document-processing/doc_processor.py --help
 
-# Create configuration template
+# Create organized use case structure (recommended)
+python use-cases/document-processing/doc_processor.py create-use-case --name project-docs --base-url http://localhost:8080
+
+# Create configuration template (legacy)
 python use-cases/document-processing/doc_processor.py create-config
 
 # Extract documents only
-python use-cases/document-processing/doc_processor.py extract --config config.json
+python use-cases/document-processing/doc_processor.py extract --config use-cases/project-docs/config.json
 
 # Merge existing documents
 python use-cases/document-processing/doc_processor.py merge --input-dir output/docs --merge-output final.md
 
 # Complete pipeline (extract + merge)
-python use-cases/document-processing/doc_processor.py full-pipeline --config config.json
+python use-cases/document-processing/doc_processor.py full-pipeline --config use-cases/project-docs/config.json
 ```
 
 ### Testing & Validation

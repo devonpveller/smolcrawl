@@ -532,9 +532,124 @@ def create_sample_config(output_path: str = "doc_processor_config.json"):
     
     print(f"📝 Sample configuration created: {output_path}")
 
+def create_use_case(name: str, base_url: str = "http://localhost:8080", categories: List[str] = None):
+    """Create a complete use case structure with configuration and directories"""
+    if categories is None:
+        categories = ['Documentation', 'API', 'Guides', 'Other']
+    
+    # Create use case directory
+    use_case_dir = Path(f"use-cases/{name}")
+    use_case_dir.mkdir(parents=True, exist_ok=True)
+    
+    # Create output directory
+    output_dir = Path(f"output/{name}")
+    output_dir.mkdir(parents=True, exist_ok=True)
+    
+    # Create configuration
+    config = ProcessingConfig(
+        base_url=base_url,
+        url_list_file=None,
+        start_urls=[base_url],
+        output_dir=f"output/{name}",
+        merge_output=f"output/{name}/merged_documentation.md",
+        max_workers=6,
+        categories=categories,
+        category_order=categories
+    )
+    
+    config_path = use_case_dir / "config.json"
+    with open(config_path, 'w', encoding='utf-8') as f:
+        json.dump(asdict(config), f, indent=4)
+    
+    # Create README file
+    readme_content = f"""# {name.title().replace('-', ' ')} Documentation Crawler
+
+This use case is configured to crawl and process documentation from `{base_url}`.
+
+## Purpose
+
+Extracts, processes, and merges web documentation from {base_url} into clean markdown collections.
+
+## Configuration
+
+- **Base URL**: `{base_url}`
+- **Output Directory**: `output/{name}/`
+- **Merged Output**: `output/{name}/merged_documentation.md`
+- **Categories**: {', '.join(categories)}
+
+## Usage
+
+### Quick Start
+```bash
+# Run complete processing pipeline
+python use-cases/document-processing/doc_processor.py full-pipeline --config use-cases/{name}/config.json
+```
+
+### Step-by-Step Processing
+```bash
+# Extract documents only
+python use-cases/document-processing/doc_processor.py extract --config use-cases/{name}/config.json
+
+# Merge extracted documents
+python use-cases/document-processing/doc_processor.py merge --config use-cases/{name}/config.json
+```
+
+### Verify Configuration
+```bash
+# Show help and available commands
+python use-cases/document-processing/doc_processor.py --help
+
+# Test configuration
+python use-cases/document-processing/doc_processor.py create-config
+```
+
+## Output Structure
+
+```
+output/{name}/                      # Root output directory
+├── {categories[0]}/                # {categories[0]} category
+├── {categories[1]}/                # {categories[1]} documentation  
+├── {categories[2]}/                # {categories[2]} documents
+├── {categories[3] if len(categories) > 3 else 'Other'}/                          # {categories[3] if len(categories) > 3 else 'Other'} content
+└── merged_documentation.md         # Combined documentation
+
+use-cases/{name}/                   # Use case configuration
+├── config.json                     # Configuration file
+└── README.md                       # This file
+```
+
+## Configuration Details
+
+- **Max Workers**: 6 (configurable for performance)
+- **Timeout**: 15 seconds per request
+- **Delay**: 0.1 seconds between requests (respectful crawling)
+- **Content Processing**: Uses readability algorithm for clean extraction
+- **Output Format**: Markdown with metadata headers
+- **Table of Contents**: Automatically generated
+
+## Prerequisites
+
+Make sure your server at {base_url} is running before starting the crawl process.
+
+## Performance
+
+Expected processing rate: ~4-6 URLs per second with 6 worker threads on localhost servers.
+"""
+    
+    readme_path = use_case_dir / "README.md"
+    with open(readme_path, 'w', encoding='utf-8') as f:
+        f.write(readme_content)
+    
+    print(f"✅ Use case '{name}' created successfully!")
+    print(f"📁 Configuration: use-cases/{name}/config.json")
+    print(f"📄 Documentation: use-cases/{name}/README.md") 
+    print(f"📂 Output directory: output/{name}/")
+    print(f"\n🚀 To start crawling:")
+    print(f"python use-cases/document-processing/doc_processor.py full-pipeline --config use-cases/{name}/config.json")
+
 def main():
     parser = argparse.ArgumentParser(description="Universal Document Processing Tool")
-    parser.add_argument('command', choices=['extract', 'merge', 'full-pipeline', 'create-config'],
+    parser.add_argument('command', choices=['extract', 'merge', 'full-pipeline', 'create-config', 'create-use-case'],
                        help='Command to execute')
     
     # Configuration
@@ -544,6 +659,10 @@ def main():
     parser.add_argument('--output-dir', default='output/extracted_docs', help='Output directory')
     parser.add_argument('--merge-output', default='merged_documentation.md', help='Merged output file')
     parser.add_argument('--max-workers', type=int, default=6, help='Number of worker threads')
+    
+    # Use case creation options
+    parser.add_argument('--name', help='Name for new use case (required for create-use-case)')
+    parser.add_argument('--categories', nargs='+', help='Categories for use case (space-separated)')
     
     # Processing options
     parser.add_argument('--input-dir', help='Input directory for merge operation')
@@ -555,6 +674,18 @@ def main():
     
     if args.command == 'create-config':
         create_sample_config()
+        return
+    
+    if args.command == 'create-use-case':
+        if not args.name:
+            print("❌ Error: --name is required for create-use-case command")
+            print("Example: python doc_processor.py create-use-case --name localhost-1313 --base-url http://localhost:1313")
+            return
+        create_use_case(
+            name=args.name,
+            base_url=args.base_url,
+            categories=args.categories
+        )
         return
     
     # Load or create configuration
