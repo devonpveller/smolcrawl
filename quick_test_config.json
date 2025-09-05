@@ -1,0 +1,28 @@
+{
+    "base_url": "http://localhost:1313",
+    "url_list_file": "quick_test_urls.txt",
+    "start_urls": null,
+    "max_workers": 2,
+    "max_retries": 2,
+    "timeout": 10,
+    "delay_between_requests": 0.5,
+    "output_dir": "output/quick-test",
+    "merge_output": "output/quick-test/merged_documentation.md",
+    "categories": [
+        "Documentation",
+        "Guides",
+        "API",
+        "Other"
+    ],
+    "category_order": [
+        "Documentation",
+        "Guides",
+        "API",
+        "Other"
+    ],
+    "clean_content": true,
+    "add_metadata": true,
+    "use_readability": true,
+    "convert_to_markdown": true,
+    "include_toc": true
+}

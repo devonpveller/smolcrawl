@@ -742,11 +742,11 @@ Expected processing rate: ~4-6 URLs per second with 6 worker threads on localhos
     with open(readme_path, 'w', encoding='utf-8') as f:
         f.write(readme_content)
     
-    print(f"✅ Use case '{name}' created successfully!")
-    print(f"📁 Configuration: use-cases/{name}/config.json")
-    print(f"📄 Documentation: use-cases/{name}/README.md") 
-    print(f"📂 Output directory: output/{name}/")
-    print(f"\n🚀 To start crawling:")
+    print(f"✓ Use case '{name}' created successfully!")
+    print(f"Configuration: use-cases/{name}/config.json")
+    print(f"Documentation: use-cases/{name}/README.md") 
+    print(f"Output directory: output/{name}/")
+    print(f"\nTo start crawling:")
     print(f"python use-cases/document-processing/doc_processor.py full-pipeline --config use-cases/{name}/config.json")
 
 def main():

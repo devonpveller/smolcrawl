@@ -1,0 +1,10 @@
+﻿http://localhost:1313
+http://localhost:1313/get-started/
+http://localhost:1313/guides/
+http://localhost:1313/manuals/
+http://localhost:1313/reference/
+http://localhost:1313/get-started/get-docker/
+http://localhost:1313/docker-hub/image-library/catalogs/
+http://localhost:1313/desktop/features/model-runner/
+http://localhost:1313/desktop/
+http://localhost:1313/desktop/use-desktop/
