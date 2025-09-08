@@ -1,0 +1,31 @@
+{
+    "base_url": "https://storage.googleapis.com/mirror-api-docs/html/df/d6f/class_mirror_1_1_network_client.html",
+    "url_list_file": null,
+    "start_urls": [
+        "https://storage.googleapis.com/mirror-api-docs/html/df/d6f/class_mirror_1_1_network_client.html"
+    ],
+    "max_workers": 6,
+    "max_retries": 3,
+    "timeout": 20,
+    "delay_between_requests": 1.0,
+    "server_intensity": 0.5,
+    "output_dir": "output/mirror-doc-api",
+    "merge_output": "output/mirror-doc-api/merged_documentation.md",
+    "categories": [
+        "Documentation",
+        "API",
+        "Guides",
+        "Other"
+    ],
+    "category_order": [
+        "Documentation",
+        "API",
+        "Guides",
+        "Other"
+    ],
+    "clean_content": true,
+    "add_metadata": true,
+    "use_readability": true,
+    "convert_to_markdown": true,
+    "include_toc": true
+}
