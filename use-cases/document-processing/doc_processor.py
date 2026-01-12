@@ -27,7 +27,7 @@ from urllib.parse import urljoin, urlparse
 from typing import List, Tuple, Dict, Any, Optional
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import threading
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass, asdict, field
 import yaml
 
 # Import dependencies with fallback handling
@@ -76,8 +76,8 @@ class ProcessingConfig:
     merge_output: str = "merged_documentation.md"
     
     # Content settings 
-    categories: List[str] = None
-    category_order: List[str] = None
+    categories: Optional[List[str]] = None
+    category_order: Optional[List[str]] = None
     clean_content: bool = True
     add_metadata: bool = True
     
