@@ -72,25 +72,73 @@ python use-cases/document-processing/doc_processor.py full-pipeline --config use
 
 ## Installation
 
-### Dependencies
-```bash
-pip install requests readabilipy markdownify pyyaml
-```
+### Quick Setup (Recommended)
 
-### Development Setup
-```bash
-# Clone the repository
+**Prerequisites:**
+- Python 3.11 or higher
+- Node.js (required for readabilipy content extraction)
+
+**Windows (PowerShell):**
+```powershell
 git clone https://github.com/bllchmbrs/smolcrawl.git
 cd smolcrawl
+.\scripts\setup.ps1
+```
 
-# Install dependencies
+**Linux/macOS:**
+```bash
+git clone https://github.com/bllchmbrs/smolcrawl.git
+cd smolcrawl
+chmod +x scripts/setup.sh
+./scripts/setup.sh
+```
+
+The setup script will:
+1. Verify Python 3.11+ and Node.js are installed
+2. Create a virtual environment (`.venv`)
+3. Install all core dependencies
+4. Install Node.js dependencies for readabilipy
+
+### Installation Options
+
+```bash
+# Core dependencies only (document processing)
 pip install -e .
+
+# Full installation (includes crawlee, tantivy search)
+pip install -e ".[full]"
+
+# Development installation (includes pytest, black, mypy)
+pip install -e ".[dev]"
+
+# Everything
+pip install -e ".[full,dev]"
+```
+
+### Using uv (Fast Alternative)
+
+If you have [uv](https://github.com/astral-sh/uv) installed:
+```bash
+uv sync                 # Core dependencies
+uv sync --extra full    # Full installation
+uv sync --extra dev     # With dev tools
+```
+
+### Manual Installation
+
+```bash
+# Minimal install for document processing
+pip install requests markdownify readabilipy pydantic PyYAML loguru typer beautifulsoup4
+
+# Don't forget Node.js dependencies
+npm install
 ```
 
 ## Requirements
 
-- Python 3.7 or higher
-- Dependencies: requests, readabilipy, markdownify, pyyaml
+- Python 3.11 or higher
+- Node.js (for readabilipy - content extraction)
+- Dependencies: pydantic, requests, readabilipy, markdownify, pyyaml, beautifulsoup4
 
 ## Usage Examples
 

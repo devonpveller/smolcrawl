@@ -20,11 +20,12 @@ python doc_processor.py discover-urls --config config.json
 
 ## Architecture Overview
 
-SmolCrawl is a **dual-architecture** system:
+SmolCrawl is a **lightweight web crawler** with unified document processing:
 
-1. **Original SmolCrawl** (`src/smolcrawl/`) - Legacy crawler with Tantivy search indexing (use for queryable indexes)
+1. **SmolCrawler** (`src/smolcrawl/crawl.py`) - Async web crawler using httpx + BeautifulSoup (no heavy dependencies)
 2. **Document Processor** (`use-cases/document-processing/`) - PRIMARY: Unified HTML→Markdown tool for bulk extraction
 3. **Use Case Framework** (`use-cases/*/`) - Specialized workflows (Unreal Engine, Blueprint API, Docker docs, etc.)
+4. **TantivyIndexer** (`src/smolcrawl/db.py`) - Optional full-text search indexing (install with `pip install smolcrawl[full]`)
 
 ## SOLID Principles & Coding Standards
 

@@ -6,6 +6,7 @@
 # ----------------------------
 pydantic>=2.0.0,<3.0.0        # Data validation - v2 required for compatibility
 requests>=2.28.0              # HTTP requests for document processing
+httpx[http2]>=0.27.0          # Async HTTP client for web crawling
 markdownify>=1.1.0            # HTML to Markdown conversion
 readabilipy>=0.3.0            # Content extraction (Mozilla Readability)
 beautifulsoup4>=4.12.0        # HTML parsing for URL discovery
@@ -13,11 +14,7 @@ lxml>=5.0.0                   # Fast XML/HTML parser (beautifulsoup backend)
 loguru>=0.7.3                 # Logging
 typer>=0.15.2                 # CLI framework
 PyYAML>=6.0                   # YAML config support
-
-# SmolCrawl Crawler Dependencies (optional - for URL discovery)
-# -------------------------------------------------------------
-crawlee[all]>=0.6.7           # Web crawler framework (requires pydantic v2)
-diskcache>=5.6.3              # Local caching
+diskcache>=5.6.3              # Local caching for crawl results
 
 # Search Index Dependencies (optional - for Tantivy search)
 # ---------------------------------------------------------
@@ -35,18 +32,18 @@ python-dotenv>=1.1.0          # Environment variable loading
 
 # Notes:
 # ------
-# 1. crawlee requires pydantic v2 - older pydantic versions will cause:
-#    "TypeError: cannot specify both default and default_factory"
+# 1. SmolCrawl uses a custom lightweight crawler (httpx + BeautifulSoup)
+#    instead of heavy frameworks like crawlee. This eliminates dependency
+#    conflicts and provides better compatibility with Pydantic v2.
 #
 # 2. On Windows, readabilipy requires Node.js installed for full functionality
 #    The code includes automatic Windows compatibility patches
 #
-# 3. For document processing only (without URL discovery), you can skip
-#    crawlee and tantivy - core extraction works with just:
-#    requests, markdownify, readabilipy, pydantic, PyYAML, loguru
+# 3. For document processing only (without search indexing), you can skip
+#    tantivy - core extraction works with just the core dependencies.
 #
 # Minimal install for document processing:
-# pip install requests markdownify readabilipy pydantic PyYAML loguru typer
+# pip install requests httpx markdownify readabilipy pydantic PyYAML loguru typer beautifulsoup4 diskcache
 #
 # Full install:
 # pip install -r requirements.txt

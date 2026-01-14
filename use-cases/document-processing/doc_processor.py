@@ -44,17 +44,18 @@ except ImportError:
     print("Warning: markdownify not available. Install with: pip install markdownify")
     markdownify = None
 
-# Import SmolCrawl functionality for URL discovery
+# Import SmolCrawl functionality for URL discovery and crawling
 try:
     import sys
     sys.path.append('../../src')
-    from smolcrawl.crawl import crawl_target
+    from smolcrawl.crawl import crawl_target, SmolCrawler
     from smolcrawl.db import Page
     CRAWL_AVAILABLE = True
-except (ImportError, TypeError, Exception) as e:
-    print(f"Warning: SmolCrawl crawling not available ({type(e).__name__}: {e}). URL discovery will be limited.")
+except ImportError as e:
+    # SmolCrawl not installed - basic URL discovery still works
     CRAWL_AVAILABLE = False
     crawl_target = None
+    SmolCrawler = None
     Page = None
 
 @dataclass
@@ -303,7 +304,7 @@ class DocumentProcessor:
     async def discover_urls(self, base_url: Optional[str] = None) -> List[str]:
         """Discover URLs using SmolCrawl's automatic crawling"""
         if not CRAWL_AVAILABLE:
-            print("❌ SmolCrawl crawling not available. Using basic URL discovery.")
+            print("ℹ️ Using basic URL discovery (extracts links from homepage)")
             return self._basic_url_discovery(base_url or self.config.base_url)
         
         target_url = base_url or self.config.base_url
