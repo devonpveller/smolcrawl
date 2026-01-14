@@ -35,18 +35,21 @@ python-dotenv>=1.1.0          # Environment variable loading
 
 # Notes:
 # ------
-# 1. crawlee requires pydantic v2 - older pydantic versions will cause:
-#    "TypeError: cannot specify both default and default_factory"
+# 1. KNOWN ISSUE: crawlee has a Pydantic v2.12+ compatibility bug
+#    (TypeError: cannot specify both default and default_factory)
+#    This affects SmolCrawl's advanced URL discovery feature.
+#    Basic URL discovery (BeautifulSoup) works as a fallback.
+#    Track: https://github.com/apify/crawlee-python/issues
 #
 # 2. On Windows, readabilipy requires Node.js installed for full functionality
 #    The code includes automatic Windows compatibility patches
 #
-# 3. For document processing only (without URL discovery), you can skip
+# 3. For document processing only (without advanced URL discovery), you can skip
 #    crawlee and tantivy - core extraction works with just:
 #    requests, markdownify, readabilipy, pydantic, PyYAML, loguru
 #
 # Minimal install for document processing:
-# pip install requests markdownify readabilipy pydantic PyYAML loguru typer
+# pip install requests markdownify readabilipy pydantic PyYAML loguru typer beautifulsoup4
 #
 # Full install:
 # pip install -r requirements.txt

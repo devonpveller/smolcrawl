@@ -52,7 +52,8 @@ try:
     from smolcrawl.db import Page
     CRAWL_AVAILABLE = True
 except (ImportError, TypeError, Exception) as e:
-    print(f"Warning: SmolCrawl crawling not available ({type(e).__name__}: {e}). URL discovery will be limited.")
+    # Known issue: crawlee has Pydantic v2.12+ compatibility bug
+    # Basic URL discovery (BeautifulSoup) still works as fallback
     CRAWL_AVAILABLE = False
     crawl_target = None
     Page = None
@@ -303,7 +304,7 @@ class DocumentProcessor:
     async def discover_urls(self, base_url: Optional[str] = None) -> List[str]:
         """Discover URLs using SmolCrawl's automatic crawling"""
         if not CRAWL_AVAILABLE:
-            print("❌ SmolCrawl crawling not available. Using basic URL discovery.")
+            print("ℹ️ Using basic URL discovery (extracts links from homepage)")
             return self._basic_url_discovery(base_url or self.config.base_url)
         
         target_url = base_url or self.config.base_url
