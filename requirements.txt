@@ -1,0 +1,50 @@
+# SmolCrawl Requirements
+# ======================
+# Python 3.11+ required
+
+# Core Dependencies (required)
+# ----------------------------
+pydantic>=2.0.0,<3.0.0        # Data validation - v2 required for compatibility
+requests>=2.28.0              # HTTP requests for document processing
+markdownify>=1.1.0            # HTML to Markdown conversion
+readabilipy>=0.3.0            # Content extraction (Mozilla Readability)
+loguru>=0.7.3                 # Logging
+typer>=0.15.2                 # CLI framework
+PyYAML>=6.0                   # YAML config support
+
+# SmolCrawl Crawler Dependencies (optional - for URL discovery)
+# -------------------------------------------------------------
+crawlee[all]>=0.6.7           # Web crawler framework (requires pydantic v2)
+diskcache>=5.6.3              # Local caching
+
+# Search Index Dependencies (optional - for Tantivy search)
+# ---------------------------------------------------------
+tantivy>=0.22.2               # Full-text search indexing
+
+# Environment/Utilities
+# ---------------------
+python-dotenv>=1.1.0          # Environment variable loading
+
+# Development Dependencies (optional)
+# -----------------------------------
+# pytest>=7.0.0               # Testing
+# black>=23.0.0               # Code formatting
+# mypy>=1.0.0                 # Type checking
+
+# Notes:
+# ------
+# 1. crawlee requires pydantic v2 - older pydantic versions will cause:
+#    "TypeError: cannot specify both default and default_factory"
+#
+# 2. On Windows, readabilipy requires Node.js installed for full functionality
+#    The code includes automatic Windows compatibility patches
+#
+# 3. For document processing only (without URL discovery), you can skip
+#    crawlee and tantivy - core extraction works with just:
+#    requests, markdownify, readabilipy, pydantic, PyYAML, loguru
+#
+# Minimal install for document processing:
+# pip install requests markdownify readabilipy pydantic PyYAML loguru typer
+#
+# Full install:
+# pip install -r requirements.txt
