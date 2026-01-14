@@ -51,9 +51,10 @@ try:
     from smolcrawl.crawl import crawl_target
     from smolcrawl.db import Page
     CRAWL_AVAILABLE = True
-except ImportError:
-    print("Warning: SmolCrawl crawling not available. URL discovery will be limited.")
+except (ImportError, TypeError, Exception) as e:
+    print(f"Warning: SmolCrawl crawling not available ({type(e).__name__}: {e}). URL discovery will be limited.")
     CRAWL_AVAILABLE = False
+    crawl_target = None
     Page = None
 
 @dataclass
