@@ -62,7 +62,7 @@ class ProcessingConfig:
     # Source settings
     base_url: str = "http://localhost:8080"
     url_list_file: Optional[str] = None
-    start_urls: Optional[List[str]] = None
+    start_urls: List[str] = field(default_factory=list)
     
     # Processing settings
     max_workers: int = 6
@@ -76,8 +76,8 @@ class ProcessingConfig:
     merge_output: str = "merged_documentation.md"
     
     # Content settings 
-    categories: Optional[List[str]] = None
-    category_order: Optional[List[str]] = None
+    categories: List[str] = field(default_factory=lambda: ['Other', 'Runtime', 'Editor', 'Plugins'])
+    category_order: List[str] = field(default_factory=list)
     clean_content: bool = True
     add_metadata: bool = True
     
@@ -87,9 +87,7 @@ class ProcessingConfig:
     include_toc: bool = True
     
     def __post_init__(self):
-        if self.categories is None:
-            self.categories = ['Other', 'Runtime', 'Editor', 'Plugins']
-        if self.category_order is None:
+        if not self.category_order:
             self.category_order = self.categories.copy()
         
         # Auto-calculate settings based on server_intensity
