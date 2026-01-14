@@ -1,11 +1,18 @@
 import os
-import tantivy
 from smolcrawl.utils import get_storage_path
-from typing import List, Iterable, Set
+from typing import List, Iterable, Set, Optional
 from pydantic import BaseModel
 from loguru import logger
 import xml.etree.ElementTree as ET
 from xml.dom import minidom
+
+# Optional tantivy import for search indexing
+try:
+    import tantivy
+    TANTIVY_AVAILABLE = True
+except ImportError:
+    tantivy = None
+    TANTIVY_AVAILABLE = False
 
 
 class Section(BaseModel):
@@ -46,7 +53,19 @@ class Page(BaseModel):
 
 
 class TantivyIndexer:
+    """Full-text search indexer using Tantivy.
+    
+    Requires tantivy to be installed: pip install tantivy
+    Or use the full installation: pip install smolcrawl[full]
+    """
+    
     def __init__(self, index_name: str, create_if_missing: bool = True):
+        if not TANTIVY_AVAILABLE:
+            raise ImportError(
+                "Tantivy is not installed. Install with: pip install tantivy\n"
+                "Or use the full installation: pip install smolcrawl[full]"
+            )
+        
         self.DB_PATH = os.path.join(get_storage_path(), "db", index_name)
         schema_builder = tantivy.SchemaBuilder()
         self.name = index_name

@@ -1,11 +1,17 @@
-from .db import TantivyIndexer, MarkdownFileIndexer, Page, Section, XmlFileIndexer
-from .crawl import crawl_target
+from .db import MarkdownFileIndexer, Page, Section, XmlFileIndexer, TANTIVY_AVAILABLE
+from .crawl import crawl_target, SmolCrawler
 import typer
 import asyncio
 from typing import List, Literal
 from loguru import logger
 from .utils import get_storage_path
 import os
+
+# Optional tantivy import
+if TANTIVY_AVAILABLE:
+    from .db import TantivyIndexer
+else:
+    TantivyIndexer = None
 
 app = typer.Typer()
 
@@ -24,13 +30,16 @@ def index(
     target_url: str = typer.Argument(..., help="The URL to crawl."),
     name: str = typer.Argument(..., help="The name of the index to create or update."),
     index_type: str = typer.Option(
-        "search", help="The type of index to create ('search' for Tantivy, 'markdown' for files, 'xml' for a single XML file)."
+        "markdown", help="The type of index to create ('search' for Tantivy, 'markdown' for files, 'xml' for a single XML file)."
     ),
 ) -> List[Page]:
     """Crawls a target URL and indexes the content into the specified index."""
     logger.info(f"Indexing {target_url} into {name}")
     crawl_results = crawl(target_url)
     if index_type == "search":
+        if not TANTIVY_AVAILABLE:
+            logger.error("Tantivy not installed. Use: pip install smolcrawl[full]")
+            raise typer.Exit(1)
         indexer = TantivyIndexer(name)
         logger.info(f"Adding {len(crawl_results)} pages to {name}")
         indexer.add_pages(crawl_results)
@@ -51,6 +60,8 @@ def index(
 @app.command()
 def list_indices() -> None:
     """Lists the available Tantivy (search) indices."""
+    if not TANTIVY_AVAILABLE:
+        logger.warning("Tantivy not installed. Use: pip install smolcrawl[full]")
     for f in os.listdir(os.path.join(get_storage_path(), "db")):
         print(f)
 
@@ -74,6 +85,10 @@ def query(
     ),
 ) -> None:
     """Queries a Tantivy index and prints the results."""
+    if not TANTIVY_AVAILABLE:
+        logger.error("Tantivy not installed. Use: pip install smolcrawl[full]")
+        raise typer.Exit(1)
+    
     indexer = TantivyIndexer(index_name)
 
     res = list(indexer.query(query, limit=limit, score_threshold=score_threshold))

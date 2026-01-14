@@ -44,18 +44,18 @@ except ImportError:
     print("Warning: markdownify not available. Install with: pip install markdownify")
     markdownify = None
 
-# Import SmolCrawl functionality for URL discovery
+# Import SmolCrawl functionality for URL discovery and crawling
 try:
     import sys
     sys.path.append('../../src')
-    from smolcrawl.crawl import crawl_target
+    from smolcrawl.crawl import crawl_target, SmolCrawler
     from smolcrawl.db import Page
     CRAWL_AVAILABLE = True
-except (ImportError, TypeError, Exception) as e:
-    # Known issue: crawlee has Pydantic v2.12+ compatibility bug
-    # Basic URL discovery (BeautifulSoup) still works as fallback
+except ImportError as e:
+    # SmolCrawl not installed - basic URL discovery still works
     CRAWL_AVAILABLE = False
     crawl_target = None
+    SmolCrawler = None
     Page = None
 
 @dataclass
