@@ -1,13 +1,30 @@
 # SmolCrawl AI Agent Instructions
 
+## Quick Start for AI Agents
+
+**Primary Tool**: [use-cases/document-processing/doc_processor.py](use-cases/document-processing/doc_processor.py) - Universal HTML→Markdown processor with server intensity control.
+
+**Key Commands**:
+```bash
+# Create new use case structure
+python doc_processor.py create-use-case --name my-docs --base-url http://localhost:8080
+
+# Full processing pipeline with intensity control (0.0=gentle, 1.0=aggressive)
+python doc_processor.py full-pipeline --config config.json --server-intensity 0.3
+
+# Extract, merge, or discover URLs individually
+python doc_processor.py extract --config config.json
+python doc_processor.py merge --input-dir output/docs --output merged.md
+python doc_processor.py discover-urls --config config.json
+```
+
 ## Architecture Overview
 
-SmolCrawl is a **dual-architecture** document processing system:
+SmolCrawl is a **dual-architecture** system:
 
-1. **Original SmolCrawl** (`src/smolcrawl/`) - Traditional web crawler with Tantivy search indexing
-2. **Document Processor** (`use-cases/document-processing/`) - Modern unified tool for large-scale HTML→Markdown conversion
-
-The project has evolved from a simple web crawler into a **production document processing toolkit** optimized for technical documentation extraction.
+1. **Original SmolCrawl** (`src/smolcrawl/`) - Legacy crawler with Tantivy search indexing (use for queryable indexes)
+2. **Document Processor** (`use-cases/document-processing/`) - PRIMARY: Unified HTML→Markdown tool for bulk extraction
+3. **Use Case Framework** (`use-cases/*/`) - Specialized workflows (Unreal Engine, Blueprint API, Docker docs, etc.)
 
 ## SOLID Principles & Coding Standards
 
@@ -256,28 +273,79 @@ class ProcessingConfig:
 2. **Version Compatibility**: Use compatible API patterns across dependency versions
 3. **Abstraction Layers**: Wrap external APIs behind internal interfaces for easier testing/mocking
 
-## Core Data Flow
+## Core Data Structures
 
+### Central Data Model: `Page` (Pydantic BaseModel)
+Located in [src/smolcrawl/db.py](src/smolcrawl/db.py):
+```python
+class Page(BaseModel):
+    url: str                    # Source URL
+    title: str                  # Page title (from HTML <title>)
+    content: str                # Markdown-converted main content
+    raw_html: str               # Original HTML (for re-extraction)
+    
+    def __hash__(self) -> int:
+        return hash(self.url)   # Enables set deduplication
+    
+    def get_sections(self) -> List[Section]:
+        # Extracts sections from markdown headers (## format)
+        pass
 ```
-URLs → Crawling/Fetching → Content Extraction → Categorization → Output (Markdown/Search Index)
-```
 
-**Key Components:**
-- `Page` objects (url, title, content, raw_html) are the central data structure
-- Three indexer types: `TantivyIndexer` (search), `MarkdownFileIndexer` (files), `XmlFileIndexer` (single XML)
-- Document processor uses `ProcessingConfig` dataclass for all configuration
+**Key Pattern**: `Page` objects are the central currency between:
+- Crawling → Page extraction → Content processors → Indexers
+- All components pass `List[Page]` for batch operations
 
-## Use Case Architecture
+### Configuration Pattern: `ProcessingConfig` (Dataclass)
+Located in [use-cases/document-processing/doc_processor.py](use-cases/document-processing/doc_processor.py):
+- **Server Intensity Control** (0.0-1.0): Auto-adjusts workers, delays, timeouts
+  - Low (0.0): 1 worker, 2.0s delay, 30s timeout, 5 retries → gentle crawling
+  - High (1.0): 12 workers, 0.0s delay, 10s timeout, 2 retries → aggressive
+- **Dual Format**: Load from `.json` OR `.yaml` files
+- **Auto-Validation**: `__post_init__()` sets category defaults and applies intensity
 
-The project is organized by **specific use cases** under `/use-cases/`:
+## Use Case Architecture & Workflows
 
-- **`blueprint-api/`** - UE5.4 Blueprint API processing with Windows batch scripts
-- **`document-processing/`** - Universal HTML→Markdown conversion (primary tool)
-- **`unreal-docs/`** - Specialized Unreal Engine documentation merging
+The project is organized by **specific use cases** under [use-cases/](use-cases/):
 
-Each use case is **self-contained** with its own README, configs, and scripts.
+1. **`document-processing/`** (PRIMARY) - Universal HTML→Markdown with server intensity control
+   - Single entry point: `doc_processor.py` for all document extraction
+   - Supports: `extract`, `merge`, `full-pipeline`, `create-config`, `create-use-case`, `discover-urls`
+   
+2. **`blueprint-api/`** - Specialized UE5.4 API processing
+   - [blueprint_api_assistant.py](use-cases/blueprint-api/blueprint_api_assistant.py) - Windows batch integration
+   - URL discovery and categorization for Blueprint API docs
+   
+3. **`unreal-docs/`** - Unreal Engine documentation merging
+   - Inherits from document processor patterns
+   
+4. **`docker-docs/`, `mirror-doc/`, `open-web-ui-docs/`, etc.** - Past processing instances
+   - Each has example configs and README showing processing patterns
+
+**Pattern**: Each use case contains:
+- `config.json` or `config.yaml` - Processing configuration
+- README explaining the workflow and URL sources
+- Output directory with categorized markdown files
+- `*_merged.md` for consolidated documentation
 
 ## Critical Development Patterns
+
+### Server Intensity Pattern (Key Innovation)
+```python
+# In ProcessingConfig.__post_init__():
+self.server_intensity = 0.5  # 0.0 (gentle) to 1.0 (aggressive)
+self._apply_server_intensity()  # Auto-calculates workers, delays, timeouts
+
+# Auto-calculation formula:
+# max_workers = 1 + (intensity * 11)           # 1-12 workers
+# delay = (1.0 - intensity) * 2.0              # 2.0s to 0.0s  
+# timeout = 30 - (intensity * 20)              # 30s to 10s
+# retries = 5 - (intensity * 3)                # 5 to 2 retries
+
+# Usage: Command-line override
+python doc_processor.py full-pipeline --config config.json --server-intensity 0.3
+```
+This is the key innovation for respecting server load while maximizing throughput.
 
 ### Configuration Pattern
 ```python
@@ -287,7 +355,8 @@ class ProcessingConfig:
     base_url: str = "http://localhost:8080"
     max_workers: int = 6
     categories: List[str] = None
-    # Supports both JSON and YAML loading
+    server_intensity: float = 0.5
+    # Supports both JSON and YAML loading via from_config_file()
 ```
 
 ### Multi-threaded Processing Pattern
@@ -295,15 +364,24 @@ class ProcessingConfig:
 # Use ThreadPoolExecutor with thread-safe counters
 with ThreadPoolExecutor(max_workers=config.max_workers) as executor:
     futures = [executor.submit(process_url, url) for url in urls]
-    # Always use self.lock for shared state updates
+    for future in as_completed(futures):
+        try:
+            result = future.result()
+            with self.lock:  # Thread-safe state updates
+                self.processed_count += 1
+        except Exception as e:
+            logger.error(f"Processing failed: {e}")
 ```
 
 ### Content Extraction Pattern
 ```python
 # readabilipy + markdownify is the standard pipeline
+from readabilipy import simple_json_from_html_string
+import markdownify
+
 content = simple_json_from_html_string(html)['content']
 markdown = markdownify.markdownify(content)
-# Windows compatibility requires readabilipy_windows_fix import
+# CRITICAL: Windows compatibility requires import readabilipy_windows_fix
 ```
 
 ### Categorization Pattern
@@ -312,34 +390,58 @@ markdown = markdownify.markdownify(content)
 def categorize_url(self, url: str) -> str:
     if '/Runtime/' in url: return 'Runtime'
     if '/Editor/' in url: return 'Editor'
-    # Categories are configurable via ProcessingConfig.categories
+    if '/Plugins/' in url: return 'Plugins'
+    return 'Other'
+    # Categories are fully configurable via ProcessingConfig.categories
 ```
 
 ## Essential Commands
 
-### Original SmolCrawl (CLI)
+### Document Processor (Primary Tool)
 ```bash
-# Traditional crawling and search indexing
+# Create configuration file (interactive wizard)
+python use-cases/document-processing/doc_processor.py create-config
+
+# Create organized use case folder structure
+python use-cases/document-processing/doc_processor.py create-use-case --name my-docs --base-url http://localhost:8080
+
+# Full processing pipeline with intensity control
+python use-cases/document-processing/doc_processor.py full-pipeline --config config.json --server-intensity 0.5
+
+# Individual operations
+python use-cases/document-processing/doc_processor.py extract --config config.json
+python use-cases/document-processing/doc_processor.py merge --input-dir output/docs --output merged.md
+python use-cases/document-processing/doc_processor.py discover-urls --config config.json --output urls.txt
+
+# Run tests to validate setup
+python tests/test_doc_processor.py
+```
+
+### Original SmolCrawl CLI (Legacy - for search indexing)
+```bash
+# Traditional crawling and Tantivy search indexing
 python -m smolcrawl crawl https://docs.unrealengine.com
 python -m smolcrawl index https://docs.unrealengine.com unreal_docs
 python -m smolcrawl query unreal_docs "blueprint components"
 ```
 
-### Document Processor (Primary Tool)
+### Blueprint API Processing (Specialized)
 ```bash
-# Modern document processing workflow
-python use-cases/document-processing/doc_processor.py create-config
-python use-cases/document-processing/doc_processor.py full-pipeline --config config.json
-
-# Testing and validation
-python tests/test_doc_processor.py
-```
-
-### Blueprint API Processing
-```bash
-# Specialized UE5.4 workflow
+# Unreal Engine 5.4 API-specific workflows
 python use-cases/blueprint-api/discover_blueprint_urls_win.py
 python use-cases/blueprint-api/blueprint_api_assistant.py
+```
+
+### Development & Testing
+```bash
+# Test configuration loading and URL processing
+python tests/test_doc_processor.py
+
+# Test readability extraction
+python tests/test_readability.py
+
+# Manual crawl validation
+python tests/test_manual_crawl.py
 ```
 
 ## Configuration System
@@ -367,6 +469,8 @@ Critical pattern: **All readabilipy usage requires Windows fix**
 import readabilipy_windows_fix
 # Patches subprocess calls to use shell=True on Windows
 ```
+
+**Seen in**: [src/smolcrawl/crawl.py](src/smolcrawl/crawl.py) (lines 14+), [use-cases/document-processing/doc_processor.py](use-cases/document-processing/doc_processor.py) (line 34)
 
 ## Performance Considerations
 
