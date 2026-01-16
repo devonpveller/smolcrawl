@@ -4,8 +4,13 @@
 
 **Primary Tool**: [use-cases/document-processing/doc_processor.py](use-cases/document-processing/doc_processor.py) - Universal HTML→Markdown processor with server intensity control.
 
+**Easiest Entry Point**: [smolcrawl.bat](smolcrawl.bat) - Interactive batch file for non-technical users (Windows). Just run it and answer prompts.
+
 **Key Commands**:
 ```bash
+# Interactive batch workflow (Windows)
+smolcrawl.bat
+
 # Create new use case structure
 python doc_processor.py create-use-case --name my-docs --base-url http://localhost:8080
 
@@ -18,6 +23,19 @@ python doc_processor.py merge --input-dir output/docs --output merged.md
 python doc_processor.py discover-urls --config config.json
 ```
 
+**Initial Setup** (required once):
+```bash
+# Windows: Run setup script first
+.\scripts\setup.ps1
+
+# Linux/macOS:
+chmod +x scripts/setup.sh && ./scripts/setup.sh
+
+# Manual: Verify Python 3.11+, Node.js, then install
+pip install -e .
+npm install  # Critical: Required for readabilipy content extraction
+```
+
 ## Architecture Overview
 
 SmolCrawl is a **lightweight web crawler** with unified document processing:
@@ -26,6 +44,13 @@ SmolCrawl is a **lightweight web crawler** with unified document processing:
 2. **Document Processor** (`use-cases/document-processing/`) - PRIMARY: Unified HTML→Markdown tool for bulk extraction
 3. **Use Case Framework** (`use-cases/*/`) - Specialized workflows (Unreal Engine, Blueprint API, Docker docs, etc.)
 4. **TantivyIndexer** (`src/smolcrawl/db.py`) - Optional full-text search indexing (install with `pip install smolcrawl[full]`)
+5. **Cache System** (`smolcrawl-data/cache/`) - diskcache-based HTTP response caching to avoid re-fetching
+
+**Critical Dependencies:**
+- **Node.js + npm**: Required for readabilipy content extraction (runs JavaScript DOM parser)
+- **package.json**: Defines readabilipy's Node.js dependencies
+- **readabilipy_windows_fix**: Patches subprocess calls on Windows (uses `shell=True`)
+- **diskcache**: Persistent caching at `smolcrawl-data/cache/crawl/`
 
 ## SOLID Principles & Coding Standards
 
@@ -396,6 +421,36 @@ def categorize_url(self, url: str) -> str:
     # Categories are fully configurable via ProcessingConfig.categories
 ```
 
+### Cache System Pattern
+```python
+# HTTP response caching with diskcache (in src/smolcrawl/utils.py)
+from diskcache import Cache
+
+def get_cache() -> Cache:
+    cache_dir = os.path.join(get_storage_path(), 'cache', 'crawl')
+    return Cache(cache_dir)
+
+# Usage in crawler - automatic caching of all HTTP responses
+cache = get_cache()
+cache_key = f"crawl:{url}"
+if cache_key in cache:
+    html = cache[cache_key]
+else:
+    response = await client.get(url)
+    html = response.text
+    cache[cache_key] = html
+
+# Cache utilities
+python use-cases/document-processing/check_cache.py    # Validate cache
+python use-cases/document-processing/examine_cache.py  # Inspect cached entries
+```
+
+**Cache Benefits:**
+- Avoids re-fetching same URLs during development/testing
+- Speeds up repeated processing runs significantly
+- Persistent across Python sessions (disk-based)
+- Location: `smolcrawl-data/cache/crawl/`
+
 ## Essential Commands
 
 ### Document Processor (Primary Tool)
@@ -455,6 +510,41 @@ python tests/test_manual_crawl.py
 - `max_workers` - Threading (6-12 for local processing)
 - `use_readability` - Content extraction method (almost always true)
 
+## Package Structure & Entry Points
+
+**Project layout:**
+```
+src/smolcrawl/          # Core library (installable package)
+  ├── crawl.py          # Async crawler with httpx + BeautifulSoup
+  ├── db.py             # Page model, indexers (Tantivy, Markdown, XML)
+  └── utils.py          # Storage paths, cache management
+
+use-cases/              # Specialized workflows & examples
+  └── document-processing/  # PRIMARY tool (doc_processor.py)
+
+smolcrawl-data/         # Runtime data (auto-created)
+  ├── cache/crawl/      # HTTP response cache (diskcache)
+  ├── markdown_files/   # Markdown indexer output
+  └── db/               # Tantivy search indexes
+
+smolcrawl.bat           # Windows batch interface
+scripts/                # Setup automation
+pyproject.toml          # Package definition with CLI entry point
+package.json            # Node.js dependencies for readabilipy
+```
+
+**CLI Entry Points:**
+```bash
+# Legacy CLI (defined in pyproject.toml [project.scripts])
+python -m smolcrawl crawl <url>   # OR: smolcrawl crawl <url> (if installed)
+
+# Modern workflow (document processor)
+python use-cases/document-processing/doc_processor.py <command>
+
+# Batch interface (Windows)
+smolcrawl.bat   # Interactive prompts for all parameters
+```
+
 ## Testing Philosophy
 
 - `tests/test_doc_processor.py` - Comprehensive validation of document processor
@@ -471,7 +561,27 @@ import readabilipy_windows_fix
 # Patches subprocess calls to use shell=True on Windows
 ```
 
-**Seen in**: [src/smolcrawl/crawl.py](src/smolcrawl/crawl.py) (lines 14+), [use-cases/document-processing/doc_processor.py](use-cases/document-processing/doc_processor.py) (line 34)
+**Why this matters:**
+- readabilipy calls Node.js via subprocess
+- Windows requires `shell=True` for npm/node commands
+- Without fix: "FileNotFoundError: [WinError 2] The system cannot find the file specified"
+- Fix location: [use-cases/document-processing/readabilipy_windows_fix.py](use-cases/document-processing/readabilipy_windows_fix.py)
+
+**Implementation Pattern:**
+```python
+# In crawl.py and doc_processor.py
+if platform.system() == 'Windows':
+    import subprocess
+    import readabilipy.utils
+    
+    def _patched_have_npm():
+        subprocess.run(["npm", "version"], shell=True, ...)  # shell=True is key
+    
+    # Monkey-patch the readabilipy functions
+    readabilipy.utils.have_npm = _patched_have_npm
+```
+
+**Seen in**: [src/smolcrawl/crawl.py](src/smolcrawl/crawl.py) (lines 25-80), [use-cases/document-processing/doc_processor.py](use-cases/document-processing/doc_processor.py) (line 34)
 
 ## Performance Considerations
 
