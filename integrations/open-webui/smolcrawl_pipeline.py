@@ -11,6 +11,7 @@ requirements: httpx, markdownify, readabilipy, beautifulsoup4, lxml
 import queue
 import re
 import threading
+import time
 from typing import Generator, Iterator, List, Optional, Union
 from urllib.parse import urlparse
 
@@ -63,6 +64,9 @@ class Pipeline:
         kb_name = self._extract_kb_name(user_message, url)
         return self._run_pipeline(url, kb_name)
 
+    # Interval in seconds between keepalive messages when no progress arrives
+    _HEARTBEAT_INTERVAL = 10
+
     def _run_pipeline(self, url: str, kb_name: str) -> Generator[str, None, None]:
         """Execute the full crawl → augment → upload pipeline with streaming."""
         from smolcrawl.crawl import crawl_target_sync
@@ -74,28 +78,64 @@ class Pipeline:
         yield f"**Knowledge Base:** {kb_name}\n"
         yield f"**Max Pages:** {self.valves.max_pages}\n\n"
 
-        # Phase 1: Crawl
+        # ── Phase 1: Crawl (runs in background thread with heartbeat) ──
         yield f"### Phase 1: Crawling\n\n"
-        try:
-            intensity = self.valves.server_intensity
-            max_concurrent = max(1, int(1 + (intensity * 11)))
-            delay = (1.0 - intensity) * 2.0
-            pages = crawl_target_sync(
-                url,
-                max_pages=self.valves.max_pages,
-                max_concurrent=max_concurrent,
-                delay=delay,
-            )
-            yield f"Crawled **{len(pages)}** pages.\n\n"
-        except Exception as e:
-            yield f"**Error during crawl:** {e}\n"
-            return
+        crawl_queue: queue.Queue = queue.Queue()
+
+        def crawl_worker():
+            try:
+                intensity = self.valves.server_intensity
+                max_concurrent = max(1, int(1 + (intensity * 11)))
+                delay = (1.0 - intensity) * 2.0
+
+                def on_page(page_count, page_url):
+                    crawl_queue.put(("progress", page_count, page_url))
+
+                result = crawl_target_sync(
+                    url,
+                    max_pages=self.valves.max_pages,
+                    max_concurrent=max_concurrent,
+                    delay=delay,
+                    on_page_crawled=on_page,
+                )
+                crawl_queue.put(("done", result))
+            except Exception as e:
+                crawl_queue.put(("error", str(e)))
+
+        thread = threading.Thread(target=crawl_worker, daemon=True)
+        thread.start()
+
+        pages = None
+        last_count = 0
+        last_yield = time.monotonic()
+        while True:
+            try:
+                item = crawl_queue.get(timeout=self._HEARTBEAT_INTERVAL)
+            except queue.Empty:
+                elapsed = int(time.monotonic() - last_yield)
+                yield f"⏳ Still crawling… {last_count} pages so far ({elapsed}s elapsed)\n"
+                last_yield = time.monotonic()
+                continue
+
+            if item[0] == "progress":
+                last_count = item[1]
+                yield f"Crawled page {last_count}: {item[2]}\n"
+                last_yield = time.monotonic()
+            elif item[0] == "done":
+                pages = item[1]
+                yield f"\nCrawled **{len(pages)}** pages total.\n\n"
+                break
+            elif item[0] == "error":
+                yield f"**Error during crawl:** {item[1]}\n"
+                return
+
+        thread.join(timeout=5)
 
         if not pages:
             yield "No pages found. Check the URL and try again.\n"
             return
 
-        # Phase 2: Augment
+        # ── Phase 2: Augment ──
         if self.valves.augment_for_rag:
             yield f"### Phase 2: Augmenting for RAG\n\n"
             try:
@@ -104,7 +144,7 @@ class Pipeline:
             except Exception as e:
                 yield f"**Warning:** Augmentation failed ({e}), uploading raw content.\n\n"
 
-        # Phase 3: Upload
+        # ── Phase 3: Upload (runs in background thread with heartbeat) ──
         yield f"### Phase 3: Uploading to Knowledge Base\n\n"
         config = OwuiConfig(
             base_url=self.valves.owui_base_url,
@@ -123,7 +163,7 @@ class Pipeline:
                     result = client.sync_pages(
                         pages, kb_name,
                         on_progress=lambda cur, tot, name:
-                            progress_queue.put((cur, tot, name)),
+                            progress_queue.put(("progress", cur, tot, name)),
                     )
                     result_holder.append(result)
             except Exception as e:
@@ -134,14 +174,24 @@ class Pipeline:
         thread = threading.Thread(target=upload_worker, daemon=True)
         thread.start()
 
+        last_upload_count = 0
+        last_yield = time.monotonic()
         while True:
-            item = progress_queue.get()
+            try:
+                item = progress_queue.get(timeout=self._HEARTBEAT_INTERVAL)
+            except queue.Empty:
+                elapsed = int(time.monotonic() - last_yield)
+                yield f"⏳ Still uploading… {last_upload_count}/{len(pages)} files ({elapsed}s since last update)\n"
+                continue
+
             if item is None:
                 break
-            cur, tot, name = item
-            yield f"Uploading: {cur}/{tot} — {name}\n"
+            _, cur, tot, name = item
+            last_upload_count = cur
+            last_yield = time.monotonic()
+            yield f"Uploaded: {cur}/{tot} — {name}\n"
 
-        thread.join(timeout=30)
+        thread.join(timeout=60)
 
         if error_holder:
             yield f"\n**Upload error:** {error_holder[0]}\n"

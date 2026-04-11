@@ -5,7 +5,7 @@ Async web crawler using httpx + BeautifulSoup for recursive crawling.
 No heavy dependencies - replaces crawlee for simpler, more compatible crawling.
 """
 
-from typing import List, Optional, Set
+from typing import Callable, List, Optional, Set
 from urllib.parse import urljoin, urlparse
 import asyncio
 import time
@@ -227,6 +227,7 @@ class SmolCrawler:
         num_priority_levels: int = 4,
         host_delays: Optional[dict] = None,
         user_agent: str = "SmolCrawl/2.0",
+        on_page_crawled: Optional[Callable[[int, str], None]] = None,
     ):
         self.max_pages = max_pages
         self.max_concurrent = max_concurrent
@@ -248,6 +249,7 @@ class SmolCrawler:
             
         # Results
         self.pages: List[Page] = []
+        self.on_page_crawled = on_page_crawled
         
         # Concurrency control
         self.semaphore = asyncio.Semaphore(max_concurrent)
@@ -326,7 +328,14 @@ class SmolCrawler:
             self.pages.append(page)
             # Log with depth info
             logger.info(f"[D{entry.depth}] Scraped: {page.title[:40]}... ({entry.url})")
-            
+
+            # Notify callback
+            if self.on_page_crawled:
+                try:
+                    self.on_page_crawled(len(self.pages), entry.url)
+                except Exception:
+                    pass  # Don't let callback errors stop crawling
+
             # Progress update
             if len(self.pages) % 10 == 0:
                 logger.info(f"Progress: {len(self.pages)} pages")
@@ -386,6 +395,7 @@ async def crawl_target(
     max_concurrent: int = 10,
     delay: float = 0.1,
     use_cache: bool = True,
+    on_page_crawled: Optional[Callable[[int, str], None]] = None,
 ) -> List[Page]:
     """Crawl a target URL and return extracted pages."""
     logger.info(f"Starting crawl of {target_url}")
@@ -396,13 +406,22 @@ async def crawl_target(
         cached_pages = cache.get(target_url)
         if cached_pages:
             logger.info(f"Using cached results for {target_url} ({len(cached_pages)} pages)")
-            return [Page(**page) for page in cached_pages]
+            pages = [Page(**page) for page in cached_pages]
+            # Still notify callback for cached pages so progress is visible
+            if on_page_crawled:
+                for i, page in enumerate(pages, 1):
+                    try:
+                        on_page_crawled(i, page.url)
+                    except Exception:
+                        pass
+            return pages
 
     # Run the crawler
     crawler = SmolCrawler(
         max_pages=max_pages,
         max_concurrent=max_concurrent,
         delay=delay,
+        on_page_crawled=on_page_crawled,
     )
     pages = await crawler.crawl(target_url)
 
@@ -422,6 +441,7 @@ def crawl_target_sync(
     max_concurrent: int = 10,
     delay: float = 0.1,
     use_cache: bool = True,
+    on_page_crawled: Optional[Callable[[int, str], None]] = None,
 ) -> List[Page]:
     return asyncio.run(crawl_target(
         target_url,
@@ -429,4 +449,5 @@ def crawl_target_sync(
         max_concurrent=max_concurrent,
         delay=delay,
         use_cache=use_cache,
+        on_page_crawled=on_page_crawled,
     ))
