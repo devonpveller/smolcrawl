@@ -86,7 +86,9 @@ class OwuiKnowledgeClient:
         if resp is None:
             return None
 
-        for kb in resp:
+        # Handle both list and paginated dict responses
+        items = resp.get("items", resp) if isinstance(resp, dict) else resp
+        for kb in items:
             if kb.get("name") == name:
                 return kb
         return None
@@ -102,7 +104,7 @@ class OwuiKnowledgeClient:
             Created KB dict.
         """
         body = {"name": name, "description": description}
-        resp = self._request_with_retry("POST", "/api/v1/knowledge/", json=body)
+        resp = self._request_with_retry("POST", "/api/v1/knowledge/create", json=body)
         if resp is None:
             raise RuntimeError(f"Failed to create knowledge base '{name}'")
         logger.info(f"Created knowledge base '{name}' (id={resp.get('id', 'unknown')})")
