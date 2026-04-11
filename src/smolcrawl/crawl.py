@@ -205,78 +205,86 @@ def extract_links(html: str, base_url: str) -> Set[str]:
     return links
 
 
+from .frontier import URLFrontier, URLEntry
+
 class SmolCrawler:
-    """Lightweight async web crawler using httpx + BeautifulSoup.
+    """Mercator-style web crawler with URL frontier.
     
     Features:
+        - BFS traversal with depth prioritization
+        - Per-host rate limiting (politeness)
         - Async HTTP requests with connection pooling
-        - Automatic link discovery and queueing
-        - Rate limiting and retry logic
-        - Same-domain URL filtering
         - Disk caching of results
-        
-    Example:
-        >>> crawler = SmolCrawler(max_pages=100, delay=0.1)
-        >>> pages = await crawler.crawl("https://docs.example.com")
     """
     
     def __init__(
         self,
         max_pages: int = 500,
         max_concurrent: int = 10,
-        delay: float = 0.1,
+        delay: float = 0.1, # Default host delay
         timeout: float = 30.0,
         max_retries: int = 3,
-        user_agent: str = "SmolCrawl/1.0 (https://github.com/bllchmbrs/smolcrawl)",
+        num_priority_levels: int = 4,
+        host_delays: Optional[dict] = None,
+        user_agent: str = "SmolCrawl/2.0",
     ):
-        """Initialize the crawler.
-        
-        Args:
-            max_pages: Maximum number of pages to crawl
-            max_concurrent: Maximum concurrent HTTP requests
-            delay: Delay between requests (seconds) for rate limiting
-            timeout: HTTP request timeout (seconds)
-            max_retries: Maximum retries for failed requests
-            user_agent: User-Agent header for requests
-        """
         self.max_pages = max_pages
         self.max_concurrent = max_concurrent
-        self.delay = delay
         self.timeout = timeout
         self.max_retries = max_retries
         self.user_agent = user_agent
         
-        # State
-        self.visited: Set[str] = set()
-        self.queue: asyncio.Queue = asyncio.Queue()
-        self.pages: List[Page] = []
-        self.semaphore: asyncio.Semaphore = asyncio.Semaphore(max_concurrent)
-        self.last_request_time: float = 0
+        # Mercator-style frontier
+        # Use provided delay as default host delay
+        self.frontier = URLFrontier(
+            num_priority_levels=num_priority_levels,
+            default_host_delay=delay,
+            max_urls=max_pages * 20, # Allow buffer for frontier
+        )
         
-    async def _rate_limit(self):
-        """Apply rate limiting between requests."""
-        if self.delay > 0:
-            elapsed = time.time() - self.last_request_time
-            if elapsed < self.delay:
-                await asyncio.sleep(self.delay - elapsed)
-        self.last_request_time = time.time()
-    
-    async def _fetch_url(self, client: httpx.AsyncClient, url: str) -> Optional[str]:
-        """Fetch a URL with retries and error handling.
-        
-        Args:
-            client: httpx async client
-            url: URL to fetch
+        # Apply custom host delays if provided
+        if host_delays:
+            self.frontier.back_queues.host_delays.update(host_delays)
             
-        Returns:
-            HTML content or None if failed
-        """
+        # Results
+        self.pages: List[Page] = []
+        
+        # Concurrency control
+        self.semaphore = asyncio.Semaphore(max_concurrent)
+        
+        # Keep track of active workers to know when to stop
+        self.active_workers = 0
+        
+    async def _worker(self, client: httpx.AsyncClient, base_url: str):
+        """Worker that fetches URLs from frontier."""
+        while len(self.pages) < self.max_pages:
+            # Get next URL from frontier
+            # Note: This might wait if back queues are enforcing politeness
+            entry = await self.frontier.get()
+            
+            if entry is None:
+                # Frontier empty or all hosts busy?
+                # If frontier is empty but we have active workers, we should wait
+                # because they might discover new links.
+                if self.active_workers > 0:
+                    await asyncio.sleep(0.1)
+                    continue
+                else:
+                    break
+            
+            self.active_workers += 1
+            try:
+                await self._process_url(client, entry, base_url)
+            finally:
+                self.active_workers -= 1
+                
+    async def _fetch_url(self, client: httpx.AsyncClient, url: str) -> Optional[str]:
+        """Fetch a URL with retries."""
         for attempt in range(self.max_retries):
             try:
-                await self._rate_limit()
+                # Politeness is handled by frontier/back_queues before we get here
                 response = await client.get(url, follow_redirects=True)
                 
-                # Check for HTML content
                 content_type = response.headers.get('content-type', '')
                 if 'text/html' not in content_type.lower():
                     logger.debug(f"Skipping non-HTML: {url} ({content_type})")
@@ -285,63 +293,64 @@ class SmolCrawler:
                 response.raise_for_status()
                 return response.text
                 
-            except httpx.TimeoutException:
-                logger.warning(f"Timeout fetching {url} (attempt {attempt + 1}/{self.max_retries})")
-            except httpx.HTTPStatusError as e:
-                logger.warning(f"HTTP {e.response.status_code} for {url}")
-                return None  # Don't retry HTTP errors
+            except (httpx.TimeoutException, httpx.HTTPError) as e:
+                # Log warning but don't spam for routine timeouts
+                if attempt == self.max_retries - 1:
+                    logger.warning(f"Failed to fetch {url}: {e}")
+                
             except Exception as e:
-                logger.warning(f"Error fetching {url}: {e} (attempt {attempt + 1}/{self.max_retries})")
+                logger.error(f"Error fetching {url}: {e}")
             
             if attempt < self.max_retries - 1:
-                await asyncio.sleep(1.0 * (attempt + 1))  # Exponential backoff
+                await asyncio.sleep(1.0 * (attempt + 1))
                 
         return None
-    
-    async def _process_url(self, client: httpx.AsyncClient, url: str, base_url: str):
-        """Process a single URL: fetch, extract content, discover links.
+
+    async def _process_url(
+        self, 
+        client: httpx.AsyncClient, 
+        entry: URLEntry, 
+        base_url: str
+    ):
+        """Fetch and process a single URL."""
+        if len(self.pages) >= self.max_pages:
+            return
+
+        html = await self._fetch_url(client, entry.url)
+        if not html:
+            return
         
-        Args:
-            client: httpx async client
-            url: URL to process
-            base_url: Original base URL for same-domain checking
-        """
-        async with self.semaphore:
-            html = await self._fetch_url(client, url)
-            if not html:
-                return
-                
-            # Extract page content
-            page = extract_from_html(url, html)
-            if page:
-                self.pages.append(page)
-                logger.debug(f"Extracted: {page.title[:50]}... ({url})")
+        # Extract content
+        page = extract_from_html(entry.url, html)
+        if page:
+            self.pages.append(page)
+            # Log with depth info
+            logger.info(f"[D{entry.depth}] Scraped: {page.title[:40]}... ({entry.url})")
             
-            # Discover and queue new links
-            links = extract_links(html, url)
+            # Progress update
+            if len(self.pages) % 10 == 0:
+                logger.info(f"Progress: {len(self.pages)} pages")
+        
+        # Discover links and add to frontier (depth + 1)
+        if len(self.pages) < self.max_pages:
+            links = extract_links(html, entry.url)
             for link in links:
-                if link not in self.visited and len(self.visited) < self.max_pages:
-                    self.visited.add(link)
-                    await self.queue.put(link)
-    
+                if is_same_domain(link, base_url):
+                    self.frontier.add(
+                        url=link,
+                        depth=entry.depth + 1,
+                        parent_url=entry.url,
+                    )
+
     async def crawl(self, start_url: str) -> List[Page]:
-        """Crawl a website starting from the given URL.
-        
-        Args:
-            start_url: Starting URL for the crawl
-            
-        Returns:
-            List of extracted Page objects
-        """
-        logger.info(f"Starting crawl of {start_url} (max {self.max_pages} pages)")
+        """Start crawling from the given URL."""
+        logger.info(f"Starting Mercator crawl of {start_url} (max {self.max_pages})")
         start_time = time.time()
         
-        # Normalize start URL
-        start_url = normalize_url(start_url)
-        self.visited.add(start_url)
-        await self.queue.put(start_url)
+        # Seed the frontier
+        self.frontier.add(start_url, depth=0)
         
-        # Configure HTTP client
+        # Configure client
         headers = {"User-Agent": self.user_agent}
         limits = httpx.Limits(max_connections=self.max_concurrent * 2)
         
@@ -352,28 +361,22 @@ class SmolCrawler:
             http2=True,
         ) as client:
             
-            while not self.queue.empty() and len(self.pages) < self.max_pages:
-                # Process URLs in batches
-                batch_size = min(self.max_concurrent, self.queue.qsize())
-                tasks = []
-                
-                for _ in range(batch_size):
-                    if self.queue.empty():
-                        break
-                    url = await self.queue.get()
-                    tasks.append(self._process_url(client, url, start_url))
-                
-                if tasks:
-                    await asyncio.gather(*tasks, return_exceptions=True)
-                    
-                # Progress update
-                if len(self.pages) % 10 == 0 and self.pages:
-                    elapsed = time.time() - start_time
-                    rate = len(self.pages) / elapsed if elapsed > 0 else 0
-                    logger.info(f"Progress: {len(self.pages)} pages ({rate:.1f} pages/sec)")
+            # Run workers
+            workers = [
+                asyncio.create_task(self._worker(client, start_url))
+                for _ in range(self.max_concurrent)
+            ]
+            
+            await asyncio.gather(*workers, return_exceptions=True)
         
         elapsed = time.time() - start_time
-        logger.success(f"Crawled {len(self.pages)} pages from {start_url} in {elapsed:.1f}s")
+        stats = self.frontier.stats()
+        logger.success(
+            f"Crawled {len(self.pages)} pages in {elapsed:.1f}s | "
+            f"Deduped: {stats['urls_deduplicated']} | "
+            f"Hosts: {stats['hosts_tracked']}"
+        )
+        
         return self.pages
 
 
@@ -384,26 +387,7 @@ async def crawl_target(
     delay: float = 0.1,
     use_cache: bool = True,
 ) -> List[Page]:
-    """Crawl a target URL and return extracted pages.
-    
-    This is the main entry point for crawling. It uses disk caching
-    to avoid re-crawling the same URL within 72 hours.
-    
-    Args:
-        target_url: The URL to start crawling from
-        max_pages: Maximum number of pages to crawl
-        max_concurrent: Maximum concurrent HTTP requests
-        delay: Delay between requests (seconds)
-        use_cache: Whether to use disk cache for results
-        
-    Returns:
-        List of Page objects with extracted content
-        
-    Example:
-        >>> import asyncio
-        >>> pages = asyncio.run(crawl_target("https://docs.example.com"))
-        >>> print(f"Crawled {len(pages)} pages")
-    """
+    """Crawl a target URL and return extracted pages."""
     logger.info(f"Starting crawl of {target_url}")
     cache = get_cache("crawl")
 
@@ -439,20 +423,6 @@ def crawl_target_sync(
     delay: float = 0.1,
     use_cache: bool = True,
 ) -> List[Page]:
-    """Synchronous wrapper for crawl_target.
-    
-    Use this when you need to crawl from synchronous code.
-    
-    Args:
-        target_url: The URL to start crawling from
-        max_pages: Maximum number of pages to crawl
-        max_concurrent: Maximum concurrent HTTP requests
-        delay: Delay between requests (seconds)
-        use_cache: Whether to use disk cache for results
-        
-    Returns:
-        List of Page objects with extracted content
-    """
     return asyncio.run(crawl_target(
         target_url,
         max_pages=max_pages,
