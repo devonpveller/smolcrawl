@@ -24,7 +24,6 @@ class Pipeline:
         """User-configurable settings shown in OWUI admin panel."""
         owui_base_url: str = "http://openwebui:8080"
         owui_api_key: str = ""
-        knowledge_base_name: str = ""
         server_intensity: float = 0.3
         max_pages: int = 200
         upload_concurrency: int = 3
@@ -58,19 +57,17 @@ class Pipeline:
         """
         url = self._extract_url(user_message)
         if not url:
-            return ("Please provide a URL to crawl.\n\n"
-                    "Example: `crawl https://docs.example.com`")
+            return ("Please provide a URL to crawl and a knowledge base name.\n\n"
+                    "Example: `crawl https://docs.example.com into My KB Name`")
 
-        return self._run_pipeline(url)
+        kb_name = self._extract_kb_name(user_message, url)
+        return self._run_pipeline(url, kb_name)
 
-    def _run_pipeline(self, url: str) -> Generator[str, None, None]:
+    def _run_pipeline(self, url: str, kb_name: str) -> Generator[str, None, None]:
         """Execute the full crawl → augment → upload pipeline with streaming."""
         from smolcrawl.crawl import crawl_target_sync
         from smolcrawl.augment import augment_pages
         from smolcrawl.owui_client import OwuiConfig, OwuiKnowledgeClient
-
-        domain = urlparse(url).netloc
-        kb_name = self.valves.knowledge_base_name or f"SmolCrawl - {domain}"
 
         yield f"## SmolCrawl Pipeline\n\n"
         yield f"**Target:** {url}\n"
@@ -162,6 +159,21 @@ class Pipeline:
             yield f"| Knowledge Base | {kb_name} |\n"
         else:
             yield "\n**Upload completed** (no result details available).\n"
+
+    @staticmethod
+    def _extract_kb_name(message: str, url: str) -> str:
+        """Extract knowledge base name from the message, falling back to domain."""
+        # Look for patterns like: "into <name>", "as <name>", "kb:<name>"
+        for pattern in [
+            r'(?:into|to|as|kb:|knowledge[- ]?base[: ])\s*["\']?(.+?)["\']?\s*$',
+            r'(?:into|to|as|kb:|knowledge[- ]?base[: ])\s*["\']?(.+?)["\']?(?:\s+(?:with|using|from))',
+        ]:
+            m = re.search(pattern, message, re.IGNORECASE)
+            if m:
+                name = m.group(1).strip().strip('"\'')
+                if name and name != url:
+                    return name
+        return f"SmolCrawl - {urlparse(url).netloc}"
 
     @staticmethod
     def _extract_url(message: str) -> Optional[str]:
