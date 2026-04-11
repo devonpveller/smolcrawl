@@ -26,7 +26,7 @@ class Pipeline:
         owui_api_key: str = ""
         server_intensity: float = 0.3
         max_pages: int = 200
-        upload_concurrency: int = 3
+        upload_concurrency: int = 1
         augment_for_rag: bool = True
 
     def __init__(self):

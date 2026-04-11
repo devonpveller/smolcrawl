@@ -28,7 +28,7 @@ class OwuiConfig:
     base_url: str = "http://localhost:3000"
     api_key: str = ""
     knowledge_base_name: str = ""
-    upload_concurrency: int = 3
+    upload_concurrency: int = 1
     retry_attempts: int = 3
     retry_backoff_base: float = 1.0
     processing_timeout: int = 300
@@ -58,7 +58,7 @@ class OwuiKnowledgeClient:
                 "Authorization": f"Bearer {config.api_key}",
                 "Accept": "application/json",
             },
-            timeout=30.0,
+            timeout=120.0,
         )
 
     def close(self):
