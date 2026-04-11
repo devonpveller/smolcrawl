@@ -18,6 +18,7 @@ services:
       - pipelines-data:/app/pipelines
     environment:
       - PIPELINES_DIR=/app/pipelines
+      - PIPELINES_API_KEY=0p3n-w3bu!
     networks:
       - ai-stack
     restart: unless-stopped
