@@ -1,0 +1,6 @@
+# Progress Log
+
+## 2026-01-16
+- Researched codebase to confirm domain link collection strategy.
+- Verified that `SmolCrawler` and `extract_links` strictly filter for the same `netloc`.
+- Created documentation in `docs/smolcrawl-domain-link-strategy.md` explaining the implementation and behavior.
