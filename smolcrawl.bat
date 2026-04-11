@@ -105,6 +105,35 @@ echo [3/3] Processing completed successfully!
 
 echo.
 echo ================================
+echo Optional: Upload to Open WebUI
+echo ================================
+echo.
+set /p OWUI_UPLOAD="Would you like to upload to Open WebUI? (y/n, default n): "
+if /i "%OWUI_UPLOAD%"=="y" (
+    set /p OWUI_URL="  Open WebUI URL [http://localhost:3000]: "
+    if "%OWUI_URL%"=="" set OWUI_URL=http://localhost:3000
+    set /p OWUI_API_KEY="  API Key: "
+    if "%OWUI_API_KEY%"=="" (
+        echo X API Key is required for OWUI upload
+        goto :skip_owui
+    )
+    set /p KB_NAME="  Knowledge Base Name [SmolCrawl - %PROJECT_NAME%]: "
+    if "%KB_NAME%"=="" set KB_NAME=SmolCrawl - %PROJECT_NAME%
+
+    echo.
+    echo [4/4] Uploading to Open WebUI knowledge base...
+    call python use-cases\document-processing\doc_processor.py owui-sync --input-dir "output\%PROJECT_NAME%" --owui-url "%OWUI_URL%" --owui-api-key "%OWUI_API_KEY%" --kb-name "%KB_NAME%"
+    if not %errorlevel%==0 (
+        echo X Failed to upload to Open WebUI
+        echo Continuing without OWUI upload...
+    ) else (
+        echo [4/4] Upload to Open WebUI completed!
+    )
+)
+:skip_owui
+
+echo.
+echo ================================
 echo ^ SmolCrawl completed successfully!
 echo ================================
 echo.

@@ -1,8 +1,11 @@
 from .db import MarkdownFileIndexer, Page, Section, XmlFileIndexer, TANTIVY_AVAILABLE
-from .crawl import crawl_target, SmolCrawler
+from .crawl import crawl_target, crawl_target_sync, SmolCrawler
+from .augment import augment_markdown, augment_pages
+from .owui_client import OwuiConfig, OwuiKnowledgeClient, SyncResult
 import typer
 import asyncio
-from typing import List, Literal
+from pathlib import Path
+from typing import List, Literal, Optional
 from loguru import logger
 from .utils import get_storage_path
 import os
@@ -95,6 +98,144 @@ def query(
     logger.success(f"Found {len(res)} results")
     for r in res:
         logger.info(f" - {r.title} / {r.url}")
+
+
+@app.command()
+def augment(
+    input_dir: str = typer.Argument(..., help="Directory of markdown files to augment."),
+    output_dir: str = typer.Option(None, help="Output directory (default: <input_dir>_augmented)."),
+) -> None:
+    """Augment markdown files with RAG metadata headers. No OWUI required."""
+    input_path = Path(input_dir)
+    if not input_path.exists():
+        logger.error(f"Input directory not found: {input_dir}")
+        raise typer.Exit(1)
+
+    out_path = Path(output_dir) if output_dir else Path(f"{input_dir}_augmented")
+    out_path.mkdir(parents=True, exist_ok=True)
+
+    count = 0
+    for md_file in input_path.rglob("*.md"):
+        content = md_file.read_text(encoding="utf-8")
+        rel = md_file.relative_to(input_path)
+        augmented = augment_markdown(content, source_url=str(rel), doc_title=md_file.stem)
+        dest = out_path / rel
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        dest.write_text(augmented, encoding="utf-8")
+        count += 1
+
+    logger.success(f"Augmented {count} files → {out_path}")
+
+
+@app.command("owui-sync")
+def owui_sync(
+    input_dir: str = typer.Argument(..., help="Directory of markdown files to upload."),
+    owui_url: str = typer.Option("http://localhost:3000", help="Open WebUI base URL."),
+    owui_api_key: str = typer.Option(..., envvar="OWUI_API_KEY", help="OWUI API key."),
+    kb_name: str = typer.Option("SmolCrawl Docs", help="Knowledge base name."),
+    concurrency: int = typer.Option(3, help="Upload concurrency."),
+) -> None:
+    """Upload a directory of markdown files to an OWUI knowledge base."""
+    input_path = Path(input_dir)
+    if not input_path.exists():
+        logger.error(f"Input directory not found: {input_dir}")
+        raise typer.Exit(1)
+
+    # Build Page objects from markdown files
+    pages = []
+    for md_file in input_path.rglob("*.md"):
+        content = md_file.read_text(encoding="utf-8")
+        rel = md_file.relative_to(input_path)
+        pages.append(Page(
+            url=str(rel),
+            title=md_file.stem,
+            content=content,
+            raw_html="",
+        ))
+
+    if not pages:
+        logger.warning("No markdown files found.")
+        raise typer.Exit(1)
+
+    logger.info(f"Found {len(pages)} markdown files to sync")
+
+    config = OwuiConfig(
+        base_url=owui_url,
+        api_key=owui_api_key,
+        knowledge_base_name=kb_name,
+        upload_concurrency=concurrency,
+    )
+    with OwuiKnowledgeClient(config) as client:
+        result = client.sync_pages(
+            pages, kb_name,
+            on_progress=lambda cur, tot, name: logger.info(f"[{cur}/{tot}] {name}"),
+        )
+
+    logger.success(
+        f"Sync complete: {result.uploaded} uploaded, "
+        f"{result.skipped} skipped, {result.failed} failed"
+    )
+    if result.errors:
+        for err in result.errors:
+            logger.error(f"  {err}")
+
+
+@app.command("owui-pipeline")
+def owui_pipeline(
+    url: str = typer.Argument(..., help="URL to crawl."),
+    owui_url: str = typer.Option("http://localhost:3000", help="Open WebUI base URL."),
+    owui_api_key: str = typer.Option(..., envvar="OWUI_API_KEY", help="OWUI API key."),
+    kb_name: str = typer.Option("", help="Knowledge base name (auto-generated from domain if empty)."),
+    server_intensity: float = typer.Option(0.3, help="Crawl intensity 0.0-1.0."),
+    max_pages: int = typer.Option(500, help="Maximum pages to crawl."),
+    no_augment: bool = typer.Option(False, help="Skip RAG augmentation step."),
+    concurrency: int = typer.Option(3, help="Upload concurrency."),
+) -> None:
+    """Full pipeline: crawl → augment → upload to OWUI knowledge base."""
+    from urllib.parse import urlparse
+
+    # Auto-generate KB name from domain
+    if not kb_name:
+        domain = urlparse(url).netloc
+        kb_name = f"SmolCrawl - {domain}"
+
+    # Step 1: Crawl
+    logger.info(f"Step 1/3: Crawling {url} (max {max_pages} pages, intensity {server_intensity})")
+    max_concurrent = max(1, int(1 + (server_intensity * 11)))
+    delay = (1.0 - server_intensity) * 2.0
+    pages = crawl_target_sync(url, max_pages=max_pages, max_concurrent=max_concurrent, delay=delay)
+    logger.success(f"Crawled {len(pages)} pages")
+
+    # Step 2: Augment
+    if not no_augment:
+        logger.info(f"Step 2/3: Augmenting {len(pages)} pages for RAG")
+        pages = augment_pages(pages)
+        logger.success(f"Augmented {len(pages)} pages")
+    else:
+        logger.info("Step 2/3: Skipping augmentation (--no-augment)")
+
+    # Step 3: Upload
+    logger.info(f"Step 3/3: Uploading to OWUI KB '{kb_name}'")
+    config = OwuiConfig(
+        base_url=owui_url,
+        api_key=owui_api_key,
+        knowledge_base_name=kb_name,
+        upload_concurrency=concurrency,
+    )
+    with OwuiKnowledgeClient(config) as client:
+        result = client.sync_pages(
+            pages, kb_name,
+            on_progress=lambda cur, tot, name: logger.info(f"[{cur}/{tot}] {name}"),
+        )
+
+    logger.success(
+        f"Pipeline complete: {len(pages)} crawled, "
+        f"{result.uploaded} uploaded, {result.skipped} skipped, "
+        f"{result.failed} failed"
+    )
+    if result.errors:
+        for err in result.errors:
+            logger.error(f"  {err}")
 
 
 if __name__ == "__main__":

@@ -88,6 +88,13 @@ class ProcessingConfig:
     convert_to_markdown: bool = True
     include_toc: bool = True
     
+    # OWUI integration settings (all optional, defaults to disabled)
+    owui_base_url: Optional[str] = None
+    owui_api_key: Optional[str] = None
+    owui_knowledge_base_name: Optional[str] = None
+    owui_upload_concurrency: int = 3
+    augment_for_rag: bool = True
+    
     def __post_init__(self):
         if not self.category_order:
             self.category_order = self.categories.copy()
@@ -782,7 +789,7 @@ Expected processing rate: ~4-6 URLs per second with 6 worker threads on localhos
 
 def main():
     parser = argparse.ArgumentParser(description="Universal Document Processing Tool")
-    parser.add_argument('command', choices=['extract', 'merge', 'full-pipeline', 'create-config', 'create-use-case', 'discover-urls'],
+    parser.add_argument('command', choices=['extract', 'merge', 'full-pipeline', 'create-config', 'create-use-case', 'discover-urls', 'augment', 'owui-sync'],
                        help='Command to execute')
     
     # Configuration
@@ -801,6 +808,11 @@ def main():
     
     # URL discovery options
     parser.add_argument('--save-urls', help='Save discovered URLs to file (default: discovered_urls.txt)')
+    
+    # OWUI integration options
+    parser.add_argument('--owui-url', default='http://localhost:3000', help='Open WebUI base URL')
+    parser.add_argument('--owui-api-key', help='OWUI API key (or set OWUI_API_KEY env var)')
+    parser.add_argument('--kb-name', help='Knowledge base name for OWUI upload')
     
     # Processing options
     parser.add_argument('--input-dir', help='Input directory for merge operation')
@@ -865,6 +877,93 @@ def main():
         processor.merge_documents(input_dir, args.merge_output)
     elif args.command == 'full-pipeline':
         processor.run_full_pipeline()
+    elif args.command == 'augment':
+        _cmd_augment(args)
+    elif args.command == 'owui-sync':
+        _cmd_owui_sync(args)
+
+
+def _cmd_augment(args):
+    """Handle the augment command: augment markdown files with RAG metadata."""
+    try:
+        from smolcrawl.augment import augment_markdown
+    except ImportError:
+        sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..', 'src'))
+        from smolcrawl.augment import augment_markdown
+
+    input_path = Path(args.input_dir) if args.input_dir else None
+    if not input_path or not input_path.exists():
+        print("\u274c Error: --input-dir is required and must exist for augment command")
+        return
+
+    output_path = Path(args.output_dir) if args.output_dir != 'output/extracted_docs' else Path(f"{args.input_dir}_augmented")
+    output_path.mkdir(parents=True, exist_ok=True)
+
+    count = 0
+    for md_file in input_path.rglob('*.md'):
+        content = md_file.read_text(encoding='utf-8')
+        rel = md_file.relative_to(input_path)
+        augmented = augment_markdown(content, source_url=str(rel), doc_title=md_file.stem)
+        dest = output_path / rel
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        dest.write_text(augmented, encoding='utf-8')
+        count += 1
+
+    print(f"\u2713 Augmented {count} files \u2192 {output_path}")
+
+
+def _cmd_owui_sync(args):
+    """Handle the owui-sync command: upload markdown files to OWUI KB."""
+    try:
+        from smolcrawl.owui_client import OwuiConfig, OwuiKnowledgeClient
+        from smolcrawl.db import Page as SmolPage
+    except ImportError:
+        sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..', 'src'))
+        from smolcrawl.owui_client import OwuiConfig, OwuiKnowledgeClient
+        from smolcrawl.db import Page as SmolPage
+
+    input_path = Path(args.input_dir) if args.input_dir else None
+    if not input_path or not input_path.exists():
+        print("\u274c Error: --input-dir is required and must exist for owui-sync command")
+        return
+
+    api_key = args.owui_api_key or os.environ.get('OWUI_API_KEY', '')
+    if not api_key:
+        print("\u274c Error: --owui-api-key or OWUI_API_KEY environment variable is required")
+        return
+
+    kb_name = args.kb_name or 'SmolCrawl Docs'
+
+    # Build Page objects from markdown files
+    pages = []
+    for md_file in input_path.rglob('*.md'):
+        content = md_file.read_text(encoding='utf-8')
+        rel = md_file.relative_to(input_path)
+        pages.append(SmolPage(url=str(rel), title=md_file.stem, content=content, raw_html=''))
+
+    if not pages:
+        print("\u274c No markdown files found in input directory")
+        return
+
+    print(f"Found {len(pages)} markdown files to sync")
+
+    config = OwuiConfig(
+        base_url=args.owui_url,
+        api_key=api_key,
+        knowledge_base_name=kb_name,
+        upload_concurrency=3,
+    )
+    with OwuiKnowledgeClient(config) as client:
+        result = client.sync_pages(
+            pages, kb_name,
+            on_progress=lambda cur, tot, name: print(f"  [{cur}/{tot}] {name}"),
+        )
+
+    print(f"\u2713 Sync complete: {result.uploaded} uploaded, {result.skipped} skipped, {result.failed} failed")
+    if result.errors:
+        for err in result.errors:
+            print(f"  \u274c {err}")
+
 
 if __name__ == "__main__":
     main()

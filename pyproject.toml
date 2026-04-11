@@ -33,6 +33,8 @@ dependencies = [
 full = [
     "tantivy>=0.22.2",
 ]
+# OWUI integration (no extra deps needed — httpx already required)
+owui = []
 # Development dependencies
 dev = [
     "pytest>=7.0.0",

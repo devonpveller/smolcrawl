@@ -1,0 +1,26 @@
+services:
+  open-webui:
+    image: ghcr.io/open-webui/open-webui:main
+    ports:
+      - "3000:8080"
+    volumes:
+      - open-webui-data:/app/backend/data
+    environment:
+      - PIPELINES_URLS=http://pipelines:9099
+    depends_on:
+      - pipelines
+
+  pipelines:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    ports:
+      - "9099:9099"
+    volumes:
+      - pipelines-data:/app/pipelines
+    environment:
+      - PIPELINES_DIR=/app/pipelines
+
+volumes:
+  open-webui-data:
+  pipelines-data:
