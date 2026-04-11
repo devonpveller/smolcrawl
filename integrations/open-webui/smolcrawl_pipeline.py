@@ -1,8 +1,8 @@
 """
 title: SmolCrawl Knowledge Builder
 author: smolcrawl
-date: 2026-04-10
-version: 1.0
+date: 2026-04-11
+version: 2.0
 license: MIT
 description: Crawl a website, augment markdown for RAG, and upload to an OWUI knowledge collection. Streams progress in chat.
 requirements: httpx, markdownify, readabilipy, beautifulsoup4, lxml
@@ -26,7 +26,7 @@ class Pipeline:
         owui_base_url: str = "http://openwebui:8080"
         owui_api_key: str = ""
         server_intensity: float = 0.3
-        max_pages: int = 200
+        max_pages: int = 1000
         upload_concurrency: int = 1
         augment_for_rag: bool = True
 
@@ -64,11 +64,18 @@ class Pipeline:
         kb_name = self._extract_kb_name(user_message, url)
         return self._run_pipeline(url, kb_name)
 
-    # Interval in seconds between keepalive messages when no progress arrives
-    _HEARTBEAT_INTERVAL = 10
+    # Seconds between progress yields (batches events between intervals)
+    _PROGRESS_INTERVAL = 15
+    # Seconds before emitting a heartbeat when nothing happened at all
+    _HEARTBEAT_INTERVAL = 20
 
     def _run_pipeline(self, url: str, kb_name: str) -> Generator[str, None, None]:
-        """Execute the full crawl → augment → upload pipeline with streaming."""
+        """Execute the full crawl → augment → upload pipeline with streaming.
+
+        Progress updates are batched: one summary line every _PROGRESS_INTERVAL
+        seconds instead of one per page/file, keeping SSE traffic low even for
+        crawls with thousands of pages.
+        """
         from smolcrawl.crawl import crawl_target_sync
         from smolcrawl.augment import augment_pages
         from smolcrawl.owui_client import OwuiConfig, OwuiKnowledgeClient
@@ -78,8 +85,8 @@ class Pipeline:
         yield f"**Knowledge Base:** {kb_name}\n"
         yield f"**Max Pages:** {self.valves.max_pages}\n\n"
 
-        # ── Phase 1: Crawl (runs in background thread with heartbeat) ──
-        yield f"### Phase 1: Crawling\n\n"
+        # ── Phase 1: Crawl (runs in background thread) ──
+        yield "### Phase 1: Crawling\n\n"
         crawl_queue: queue.Queue = queue.Queue()
 
         def crawl_worker():
@@ -107,23 +114,35 @@ class Pipeline:
 
         pages = None
         last_count = 0
+        last_url = ""
         last_yield = time.monotonic()
+        start_time = time.monotonic()
+
         while True:
+            # Drain all available events from the queue (non-blocking after
+            # the first blocking wait), then decide whether to yield.
             try:
-                item = crawl_queue.get(timeout=self._HEARTBEAT_INTERVAL)
+                item = crawl_queue.get(timeout=1.0)
             except queue.Empty:
-                elapsed = int(time.monotonic() - last_yield)
-                yield f"⏳ Still crawling… {last_count} pages so far ({elapsed}s elapsed)\n"
-                last_yield = time.monotonic()
+                # Nothing arrived — emit heartbeat if overdue
+                if time.monotonic() - last_yield >= self._HEARTBEAT_INTERVAL:
+                    elapsed = int(time.monotonic() - start_time)
+                    yield f"⏳ Crawling… {last_count} pages ({elapsed}s)\n"
+                    last_yield = time.monotonic()
                 continue
 
             if item[0] == "progress":
                 last_count = item[1]
-                yield f"Crawled page {last_count}: {item[2]}\n"
-                last_yield = time.monotonic()
+                last_url = item[2]
+                # Yield a batched summary at most every _PROGRESS_INTERVAL
+                if time.monotonic() - last_yield >= self._PROGRESS_INTERVAL:
+                    elapsed = int(time.monotonic() - start_time)
+                    yield f"Crawled **{last_count}** pages so far ({elapsed}s)\n"
+                    last_yield = time.monotonic()
             elif item[0] == "done":
                 pages = item[1]
-                yield f"\nCrawled **{len(pages)}** pages total.\n\n"
+                elapsed = int(time.monotonic() - start_time)
+                yield f"\n✅ Crawled **{len(pages)}** pages in {elapsed}s.\n\n"
                 break
             elif item[0] == "error":
                 yield f"**Error during crawl:** {item[1]}\n"
@@ -137,15 +156,15 @@ class Pipeline:
 
         # ── Phase 2: Augment ──
         if self.valves.augment_for_rag:
-            yield f"### Phase 2: Augmenting for RAG\n\n"
+            yield "### Phase 2: Augmenting for RAG\n\n"
             try:
                 pages = augment_pages(pages)
-                yield f"Augmented **{len(pages)}** pages with metadata.\n\n"
+                yield f"✅ Augmented **{len(pages)}** pages.\n\n"
             except Exception as e:
-                yield f"**Warning:** Augmentation failed ({e}), uploading raw content.\n\n"
+                yield f"⚠️ Augmentation failed ({e}), uploading raw content.\n\n"
 
-        # ── Phase 3: Upload (runs in background thread with heartbeat) ──
-        yield f"### Phase 3: Uploading to Knowledge Base\n\n"
+        # ── Phase 3: Upload (runs in background thread) ──
+        yield "### Phase 3: Uploading to Knowledge Base\n\n"
         config = OwuiConfig(
             base_url=self.valves.owui_base_url,
             api_key=self.valves.owui_api_key,
@@ -175,21 +194,29 @@ class Pipeline:
         thread.start()
 
         last_upload_count = 0
+        upload_total = len(pages)
         last_yield = time.monotonic()
+        upload_start = time.monotonic()
+
         while True:
             try:
-                item = progress_queue.get(timeout=self._HEARTBEAT_INTERVAL)
+                item = progress_queue.get(timeout=1.0)
             except queue.Empty:
-                elapsed = int(time.monotonic() - last_yield)
-                yield f"⏳ Still uploading… {last_upload_count}/{len(pages)} files ({elapsed}s since last update)\n"
+                if time.monotonic() - last_yield >= self._HEARTBEAT_INTERVAL:
+                    elapsed = int(time.monotonic() - upload_start)
+                    yield f"⏳ Uploading… {last_upload_count}/{upload_total} ({elapsed}s)\n"
+                    last_yield = time.monotonic()
                 continue
 
             if item is None:
                 break
             _, cur, tot, name = item
             last_upload_count = cur
-            last_yield = time.monotonic()
-            yield f"Uploaded: {cur}/{tot} — {name}\n"
+            # Batched upload progress
+            if time.monotonic() - last_yield >= self._PROGRESS_INTERVAL or cur == tot:
+                elapsed = int(time.monotonic() - upload_start)
+                yield f"Uploaded **{cur}/{tot}** files ({elapsed}s)\n"
+                last_yield = time.monotonic()
 
         thread.join(timeout=60)
 
@@ -198,17 +225,18 @@ class Pipeline:
             return
 
         # Summary
+        total_elapsed = int(time.monotonic() - start_time)
         if result_holder:
             result = result_holder[0]
-            yield f"\n### Complete!\n\n"
+            yield f"\n### ✅ Complete in {total_elapsed}s\n\n"
             yield f"| Metric | Value |\n|--------|-------|\n"
             yield f"| Pages crawled | {len(pages)} |\n"
             yield f"| Files uploaded | {result.uploaded} |\n"
-            yield f"| Files skipped (unchanged) | {result.skipped} |\n"
+            yield f"| Skipped (unchanged) | {result.skipped} |\n"
             yield f"| Failures | {result.failed} |\n"
             yield f"| Knowledge Base | {kb_name} |\n"
         else:
-            yield "\n**Upload completed** (no result details available).\n"
+            yield f"\n**Upload completed** in {total_elapsed}s (no result details available).\n"
 
     @staticmethod
     def _extract_kb_name(message: str, url: str) -> str:
