@@ -5,7 +5,7 @@ date: 2026-04-10
 version: 1.0
 license: MIT
 description: Crawl a website, augment markdown for RAG, and upload to an OWUI knowledge collection. Streams progress in chat.
-requirements: smolcrawl, httpx, markdownify, readabilipy, beautifulsoup4, lxml
+requirements: httpx, markdownify, readabilipy, beautifulsoup4, lxml
 """
 
 import queue
@@ -22,7 +22,7 @@ class Pipeline:
 
     class Valves(BaseModel):
         """User-configurable settings shown in OWUI admin panel."""
-        owui_base_url: str = "http://localhost:3000"
+        owui_base_url: str = "http://openwebui:8080"
         owui_api_key: str = ""
         knowledge_base_name: str = ""
         server_intensity: float = 0.3

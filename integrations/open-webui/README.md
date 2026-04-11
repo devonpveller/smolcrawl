@@ -2,48 +2,60 @@
 
 An Open WebUI Pipeline that crawls websites and uploads the content to a knowledge base — directly from the chat UI.
 
+**This does NOT start a new Open WebUI instance.** It adds a Pipelines server that connects to your existing Open WebUI (e.g. the `ai-stack` at `127.0.0.1:3000`).
+
 ## Quick Start
 
-### Docker Compose (recommended)
+### 1. Start the Pipelines server
 
 ```bash
 cd integrations/open-webui
 docker compose up -d
 ```
 
-This starts:
-- **Open WebUI** at `http://localhost:3000`
-- **Pipelines server** at `http://localhost:9099` with SmolCrawl pre-installed
+This starts only the **Pipelines server** at `http://localhost:9099` with SmolCrawl pre-installed.
 
-### Usage
+### 2. Connect to your existing Open WebUI
 
-1. Open `http://localhost:3000` in your browser.
-2. Select **SmolCrawl Knowledge Builder** as the model.
-3. Type a URL to crawl:
+In your Open WebUI admin panel:
+
+1. Go to **Admin Panel → Settings → Connections**
+2. Under **Pipelines**, set the URL to: `http://smolcrawl-pipelines:9099`
+   - This works because the container joins the `ai-stack_default` Docker network.
+3. Save and refresh — **SmolCrawl Knowledge Builder** will appear as a selectable model.
+
+### 3. Use it
+
+1. Select **SmolCrawl Knowledge Builder** as the model in your chat.
+2. Type a URL to crawl:
    ```
    crawl https://docs.example.com
    ```
-4. Watch live progress as SmolCrawl crawls, augments, and uploads.
+3. Watch live progress as SmolCrawl crawls, augments, and uploads to a knowledge base.
 
-### Configuration
+## Configuration
 
-Configure via the OWUI admin panel under **Pipelines > SmolCrawl Knowledge Builder > Valves**:
+Configure via the OWUI admin panel under **Pipelines → SmolCrawl Knowledge Builder → Valves**:
 
-| Setting | Default | Description |
-|---------|---------|-------------|
-| `owui_base_url` | `http://localhost:3000` | Open WebUI API URL |
-| `owui_api_key` | (empty) | API key for authentication |
-| `knowledge_base_name` | (auto) | KB name (auto-generated from domain if empty) |
-| `server_intensity` | `0.3` | Crawl aggressiveness (0.0 gentle – 1.0 aggressive) |
-| `max_pages` | `200` | Maximum pages to crawl |
-| `upload_concurrency` | `3` | Parallel upload workers |
-| `augment_for_rag` | `true` | Enable RAG metadata injection |
+| Setting               | Default                 | Description                                        |
+| --------------------- | ----------------------- | -------------------------------------------------- |
+| `owui_base_url`       | `http://localhost:3000` | Open WebUI API URL                                 |
+| `owui_api_key`        | (empty)                 | API key for authentication                         |
+| `knowledge_base_name` | (auto)                  | KB name (auto-generated from domain if empty)      |
+| `server_intensity`    | `0.3`                   | Crawl aggressiveness (0.0 gentle – 1.0 aggressive) |
+| `max_pages`           | `200`                   | Maximum pages to crawl                             |
+| `upload_concurrency`  | `3`                     | Parallel upload workers                            |
+| `augment_for_rag`     | `true`                  | Enable RAG metadata injection                      |
 
-### Alternative: URL Install
+> **Note:** Since both containers share the `ai-stack_default` network, set `owui_base_url` to `http://openwebui:8080` (the container name and internal port) so the Pipelines container can reach Open WebUI directly.
 
-If you have SmolCrawl installed on your Pipelines server, install the pipeline via the OWUI admin panel using the raw file URL.
+## Alternative Install Methods
 
-### Alternative: Local Dev
+### URL Install (no Docker needed)
+
+If you already have a Pipelines server, install the pipeline via the OWUI admin panel using the raw file URL of `smolcrawl_pipeline.py`. SmolCrawl must be pip-installable on that server.
+
+### Local Dev
 
 ```bash
 pip install smolcrawl

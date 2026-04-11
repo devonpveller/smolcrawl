@@ -1,26 +1,31 @@
-services:
-  open-webui:
-    image: ghcr.io/open-webui/open-webui:main
-    ports:
-      - "3000:8080"
-    volumes:
-      - open-webui-data:/app/backend/data
-    environment:
-      - PIPELINES_URLS=http://pipelines:9099
-    depends_on:
-      - pipelines
+# SmolCrawl Pipelines service
+# Connects to your existing Open WebUI instance (ai-stack at 127.0.0.1:3000).
+# Does NOT start a new Open WebUI — only the Pipelines server.
+# Joins the ai-stack_default network so OpenWebUI can reach it by container name.
+#
+# After starting, configure Open WebUI to use this Pipelines server:
+#   Admin Panel → Settings → Connections → Pipelines URL → http://smolcrawl-pipelines:9099
 
-  pipelines:
+services:
+  smolcrawl-pipelines:
     build:
-      context: .
-      dockerfile: Dockerfile
+      context: ../..
+      dockerfile: integrations/open-webui/Dockerfile
+    container_name: smolcrawl-pipelines
     ports:
       - "9099:9099"
     volumes:
       - pipelines-data:/app/pipelines
     environment:
       - PIPELINES_DIR=/app/pipelines
+    networks:
+      - ai-stack
+    restart: unless-stopped
+
+networks:
+  ai-stack:
+    external: true
+    name: ai-stack_default
 
 volumes:
-  open-webui-data:
   pipelines-data:
