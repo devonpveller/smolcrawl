@@ -8,13 +8,56 @@ Additionally, the crawl process that _builds_ these knowledge collections is cur
 
 ## Solution Overview
 
-A single **Deep Research Function** (`class Tools`) that closes the entire loop:
+Two tool methods in a single **Deep Research Function** (`class Tools`), at different depths of commitment:
+
+### `research(query)` — Quick Exploration (minutes)
+
+A lightweight research pass that uses **web search + Fileshed** as its knowledge source. No crawling, no knowledge collections. Ideal for: getting initial ideas, scoping a topic before committing to a full deep research, or when the answer might be "good enough."
+
+1. **Web Search** — Sub-agent searches the web, stores relevant page content to Fileshed
+2. **Iterative Expansion** — Same term-expansion loop as deep research, but queries Fileshed files instead of OWUI knowledge collections
+3. **Synthesis** — Chain-of-thought answer from accumulated Fileshed content
+
+### `deep_research(query)` — Full Knowledge Building (minutes to hours)
+
+The full pipeline. Discovers domains, crawls them into OWUI knowledge collections via SmolCrawl, then runs the iterative RAG loop against the collections.
 
 1. **Domain Discovery** — Uses OWUI's web search tools to find relevant domains for a topic
 2. **User Approval** — Presents discovered domains to the user, awaits confirmation, accepts additions
 3. **Knowledge Collection Building** — Calls the SmolCrawl pipeline container to crawl approved domains into OWUI knowledge collections
 4. **Iterative RAG Research** — Expands search terms across the newly-built (and existing) collections
 5. **Chain-of-Thought Synthesis** — Produces a grounded answer from accumulated evidence
+
+### Relationship Between the Two
+
+```
+research()                          deep_research()
+(quick, web-only)                   (thorough, crawl-backed)
+
+ Web Search                          Web Search
+    │                                    │
+    ▼                                    ▼
+ Store snippets                      Discover domains
+ to Fileshed                         Present for approval
+    │                                    │
+    ▼                                    ▼
+ Iterate over                        SmolCrawl crawl
+ Fileshed content                    → OWUI KB collections
+    │                                    │
+    ▼                                    ▼
+ Synthesize                          Iterate over KBs
+    │                                    │
+    ▼                                    ▼
+ Answer                              Synthesize
+ (+ Fileshed journal)                (+ Fileshed journal)
+
+         ─── may escalate to ───►
+    User reads research() output
+    and decides to deep_research()
+    with better-informed prompting
+```
+
+A `research()` session can naturally **escalate** to `deep_research()`: the user reads the quick results, understands the landscape better, and prompts a deep research with more precise terminology. The research journal persists in Fileshed, so the deep research function can reference it.
 
 All orchestrated by the user's selected LLM through native function calling.
 
@@ -66,6 +109,200 @@ Infrastructure:
 │  • Already running          │     │  • RAG retrieval API        │
 │  • HTTP API via Pipelines   │     │  • Web search tools         │
 └─────────────────────────────┘     └─────────────────────────────┘
+```
+
+│ • HTTP API via Pipelines │ │ • Web search tools │
+└─────────────────────────────┘ └─────────────────────────────┘
+
+```
+
+## Component 0: Research (Quick Exploration)
+
+`research()` is the lightweight sibling of `deep_research()`. It lives in the same `class Tools` and shares all infrastructure (Fileshed journal, sub-agent pattern, term expansion logic). The difference: **no crawling, no knowledge collections** — it stores web search results directly to Fileshed and iterates over that stored content.
+
+### Purpose
+
+The user often doesn't know enough about a topic to craft a precise deep research query. `research()` solves this:
+
+- **Rapid topic scoping** — get a landscape view in minutes, not hours
+- **Better prompting** — the user reads research output and can formulate a much better `deep_research()` query later
+- **Sometimes sufficient** — for many questions, web search snippets + iterative expansion produce a good-enough answer without building permanent knowledge collections
+
+### Execution Flow
+
+```
+
+research(query) call — single tool invocation, no approval step
+│
+│ Step 0 — Initialize Research Journal
+│ │ Create session directory in Fileshed: research/{timestamp}-{slug}/
+│ │ Write 00-prompt.md: original query, timestamp, model
+│ │ → Emit: "📋 Research session started"
+│ │
+│ Step 1 — Web Search + Store
+│ │ Sub-agent + web search: search for the query topic
+│ │ For each relevant result:
+│ │ Sub-agent: extract/summarize the key content from the page
+│ │ Write to Fileshed: research/{slug}/sources/{domain}-{N}.md
+│ │ Write 01-sources.md: index of all stored sources with summaries
+│ │ → Emit: "🌐 Found [N] relevant sources, stored to journal"
+│ │
+│ Step 2 — Initial Analysis
+│ │ Read back: 00-prompt.md + all source files
+│ │ Sub-agent: "Summarize findings and identify knowledge gaps"
+│ │ Write 02-iteration-1.md: initial summary, identified gaps, new terms
+│ │ → Emit: "📚 Initial analysis complete — [N] concepts identified"
+│ │
+│ Step 3 — Term Expansion + Re-Search (Iteration 1)
+│ │ Sub-agent: "What adjacent concepts should we search for?"
+│ │ New web searches with expanded terms
+│ │ Store new relevant results to Fileshed (deduplicate against seen URLs)
+│ │ Sub-agent: summarize new findings
+│ │ Write 03-iteration-2.md: expanded terms, new sources, summary
+│ │ → Emit: "🔄 Expanding: [term1], [term2] — [N] new sources"
+│ │
+│ Step 4 — Continue Decision
+│ │ Sub-agent: "Would another pass yield meaningful new info? YES/NO"
+│ │ If YES → one more iteration
+│ │ → Emit: "🔄 Continuing..." or "✅ Search complete"
+│ │
+│ Step 5 — Synthesis
+│ │ Read back: 00-prompt.md + all iteration summaries + source files
+│ │ Sub-agent: "Reason step-by-step through the evidence. Cite sources."
+│ │ Write 0N-synthesis.md: CoT reasoning + answer + sources
+│ │ Write manifest.json: session index
+│ │ → Emit: answer with source references
+│ │ → Emit: "📁 Full journal: research/{slug}/"
+│ │ → Return: synthesized answer to outer LLM
+
+```
+
+### Key Differences from Deep Research
+
+| Aspect | `research()` | `deep_research()` |
+|---|---|---|
+| **Knowledge source** | Web search snippets stored in Fileshed | OWUI knowledge collections (crawled + existing) |
+| **Requires SmolCrawl** | No | Yes (container at 9099) |
+| **User approval step** | No — runs in one shot | Yes — domains presented before crawl |
+| **Tool methods** | 1: `research(query)` | 2: `deep_research(query)` + `deep_research_approve(selection)` |
+| **Duration** | Minutes | Minutes to hours |
+| **Persistence** | Fileshed journal only | Fileshed journal + OWUI knowledge collections |
+| **Iteration data** | Web search results (snippets/summaries) | Full-page RAG chunks from crawled content |
+| **Depth** | Surface-level: search result summaries | Deep: full document content, cross-referenced |
+| **Reusability** | Journal is reference material | Knowledge collections are permanently queryable |
+
+### Journal Structure
+
+```
+
+{STORAGE_BASE_PATH}/users/{user_id}/Storage/data/research/
+└── {timestamp}-{slug}/
+├── 00-prompt.md ← Original query + goal context
+├── 01-sources.md ← Index of all web sources with summaries
+├── sources/ ← Raw web content stored per-source
+│ ├── docs-unrealengine-1.md
+│ ├── benui-ca-2.md
+│ └── stackoverflow-3.md
+├── 02-iteration-1.md ← Initial analysis + gaps + new terms
+├── 03-iteration-2.md ← Expanded search results + summary
+├── 04-iteration-3.md ← (if continue-decision = YES)
+├── 0N-synthesis.md ← Final CoT synthesis
+└── manifest.json ← Session index
+
+````
+
+Note: stored under `research/` not `deep-research/` — separate namespace so findings are easy to browse and distinguish.
+
+### How Web Content Gets Stored
+
+The sub-agent's web search returns page snippets. For each relevant result, the function:
+
+1. Uses the sub-agent to extract/summarize the key content (the web search response typically includes page text or snippets).
+2. Writes a Fileshed file with metadata header + content:
+
+```markdown
+# docs.unrealengine.com — Blueprint Replication Overview
+
+[Source URL: https://docs.unrealengine.com/5.4/en-US/blueprint-replication/]
+[Retrieved: 2026-04-12T14:30:00Z]
+[Search Term: "Blueprint replication UE5"]
+[Relevance: 0.92]
+
+## Content
+
+Replication in Blueprints allows actors to synchronize their state
+across a network connection. The key concepts are:
+- RepNotify: triggered when a replicated variable changes...
+- Server/Client RPCs: functions called across the network boundary...
+...
+````
+
+3. These files are the "knowledge base" for iteration — the function reads them back like it would read RAG chunks in deep research.
+
+### Iterative Expansion Over Fileshed Content
+
+The term expansion loop works identically to deep research, but instead of `POST /api/v1/retrieval/query` against OWUI collections, the function:
+
+1. Reads the `sources/` directory for all stored content files.
+2. Sub-agent summarizes the content relevant to new search terms.
+3. Runs new web searches with expanded terms.
+4. Stores new results to `sources/`.
+5. Deduplicates by URL (tracked in `manifest.json`).
+
+This is simpler than RAG retrieval but trades off precision for speed — the function works with search snippets and summaries rather than embedded/chunked document content.
+
+### Escalation to Deep Research
+
+After `research()` completes, the user may want to go deeper. The LLM can suggest this naturally:
+
+```
+User: "research how Blueprint replication works in UE5"
+
+LLM → calls research(query="Blueprint replication in UE5")
+Function → web search → store → iterate → synthesize
+Function → returns: "Here's what I found... [synthesis].
+    The most authoritative sources were docs.unrealengine.com and
+    dev.epicgames.com. For a thorough analysis, consider running
+    deep_research() to crawl these domains into permanent
+    knowledge collections."
+
+User: "yes, let's do a deep research on this"
+
+LLM → calls deep_research(query="Blueprint replication in UE5")
+     (user now has better vocabulary from the research output)
+```
+
+The research journal in `research/{slug}/` persists in Fileshed, so the user (and the LLM) can reference it when formulating the deep research query. The deep research function can also read prior research sessions to inform its domain discovery phase.
+
+### Function Signature Addition
+
+```python
+    async def research(
+        self,
+        query: str,
+        __user__: dict = None,
+        __metadata__: dict = None,
+        __event_emitter__=None,
+        __request__=None,
+        __model__: dict = None,
+        __event_call__=None,
+        __chat_id__: str = "",
+        __message_id__: str = "",
+    ) -> str:
+        """
+        Quick research on a topic using web search. Stores findings to
+        Fileshed and iteratively expands search terms to find context
+        you might not know to search for. Faster than deep_research —
+        use this to scope a topic before committing to a full crawl.
+
+        Args:
+            query: The research question or topic to explore.
+        """
+        # 1. Initialize Fileshed journal (research/{slug}/)
+        # 2. Web search → store relevant content to sources/
+        # 3. Iterative expansion loop (2+1 iterations over Fileshed content)
+        # 4. Chain-of-thought synthesis
+        # 5. Return answer with escalation suggestion if warranted
 ```
 
 ## Component 1: Deep Research
@@ -211,17 +448,18 @@ You can also add domains: "1,2 + docs.unity3d.com"
 
 The function returns this message and waits for the user's next interaction. The LLM receives the user's reply and calls `deep_research_approve(selection="1,2,3")` to continue.
 
-This means the function exposes **two tool methods**:
+This means the function exposes **three tool methods**:
 
-1. `deep_research(query)` — starts the process, discovers domains, presents for approval
-2. `deep_research_approve(selection, additional_domains?)` — user confirms, triggers crawl + research
+1. `research(query)` — quick web-search-based exploration, stores to Fileshed, no crawl
+2. `deep_research(query)` — starts full process, discovers domains, presents for approval
+3. `deep_research_approve(selection, additional_domains?)` — user confirms, triggers crawl + research
 
 ### Function Signature
 
 ```python
 class Tools:
     class Valves(BaseModel):
-        # SmolCrawl container connection
+        # SmolCrawl container connection (deep_research only)
         smolcrawl_url: str = "http://smolcrawl-pipelines:9099"
         smolcrawl_api_key: str = "0p3n-w3bu!"
 
@@ -229,12 +467,16 @@ class Tools:
         owui_base_url: str = "http://openwebui:8080"
         owui_api_key: str = ""
 
-        # Research settings
+        # Research settings (shared by research + deep_research)
         max_iterations: int = 3
         fixed_iterations: int = 2
+        max_web_results: int = 10          # Max web search results to store per query
+        include_sources: bool = True
+
+        # Deep research specific
         top_k_per_collection: int = 5
         max_collections: int = 10
-        include_sources: bool = True
+        max_domains: int = 5
 
         # Fileshed integration
         fileshed_compatible: bool = True
@@ -244,6 +486,27 @@ class Tools:
     def __init__(self):
         self.valves = self.Valves()
         self._pending_sessions: dict = {}  # chat_id → session state
+
+    async def research(
+        self,
+        query: str,
+        __user__: dict = None,
+        ...
+    ) -> str:
+        """
+        Quick research on a topic using web search. Stores findings to
+        Fileshed and iteratively expands search terms to find context
+        you might not know to search for. Faster than deep_research —
+        use this to scope a topic before committing to a full crawl.
+
+        Args:
+            query: The research question or topic to explore.
+        """
+        # 1. Initialize Fileshed journal (research/{slug}/)
+        # 2. Web search → store relevant content to sources/
+        # 3. Iterative expansion loop (2+1 iterations over Fileshed content)
+        # 4. Chain-of-thought synthesis
+        # 5. Return answer with escalation suggestion if warranted
 
     async def deep_research(
         self,
@@ -306,7 +569,46 @@ class Tools:
 
 #### How the Outer LLM Engages
 
-With native function calling enabled, the conversation flows naturally:
+With native function calling enabled, the conversation flows naturally. The LLM decides when to call `research()` vs. `deep_research()` vs. answering directly, and handles the approval handoff because it sees all three tool descriptions.
+
+**Example 1: Quick research, then escalation**
+
+```
+User: "What's the deal with Blueprint replication in UE5?"
+
+LLM → calls research(query="Blueprint replication in UE5")
+Function → web search → store snippets to Fileshed
+         → iterate and expand terms
+         → synthesize from Fileshed content
+         → returns: summary + "For deeper analysis, consider
+           deep_research() to crawl docs.unrealengine.com and
+           dev.epicgames.com into permanent knowledge collections."
+
+LLM → presents the research summary to user
+
+User: "That's helpful but I need the full picture. Go deeper."
+
+LLM → calls deep_research(query="Blueprint replication in UE5,
+          including RepNotify, RPCs, and network relevancy")
+     (note: user now has better vocabulary from research output)
+Function → discovers domains (some overlap with research sources)
+         → returns approval list
+
+LLM → presents domain list to user
+
+User: "approve 1,2,3 and add docs.redpoint.games"
+
+LLM → calls deep_research_approve(selection="1,2,3",
+          additional_domains="docs.redpoint.games")
+Function → triggers SmolCrawl for 4 domains
+         → streams crawl progress
+         → runs iterative RAG across new + existing KBs
+         → returns CoT synthesis
+
+LLM → presents the synthesized deep research answer to user
+```
+
+**Example 2: Direct deep research (user knows what they want)**
 
 ```
 User: "I need to deeply research how Blueprint replication works in UE5"
@@ -314,21 +616,17 @@ User: "I need to deeply research how Blueprint replication works in UE5"
 LLM → calls deep_research(query="Blueprint replication in UE5")
 Function → discovers domains via web search, returns approval list
 
-LLM → presents domain list to user (from function return value)
+LLM → presents domain list to user
 
-User: "approve 1,2,3 and also add docs.redpoint.games"
+User: "approve all"
 
-LLM → calls deep_research_approve(selection="1,2,3",
-          additional_domains="docs.redpoint.games")
-Function → triggers SmolCrawl for 4 domains
-         → streams crawl progress
-         → runs iterative RAG
-         → returns CoT synthesis
+LLM → calls deep_research_approve(selection="all")
+Function → crawl → iterate → synthesize → return
 
 LLM → presents the synthesized research answer to user
 ```
 
-The LLM mediates the entire conversation. It decides when to call `deep_research()` vs. answering directly, and it naturally handles the approval handoff because it sees both tool descriptions.
+The LLM mediates the entire conversation. It can also chain tools: a Superpowers brainstorm might trigger `research()` to gather context, then the user escalates to `deep_research()` for full coverage.
 
 ### Iteration Model
 
@@ -408,21 +706,22 @@ Phase D — Chain-of-Thought Synthesis
 
 No `trigger_prefix` needed — the LLM decides when to call `deep_research()` based on the tool description and native function calling.
 
-| Valve                  | Type | Default                             | Description                                    |
-| ---------------------- | ---- | ----------------------------------- | ---------------------------------------------- |
-| `smolcrawl_url`        | str  | `"http://smolcrawl-pipelines:9099"` | SmolCrawl pipeline container URL               |
-| `smolcrawl_api_key`    | str  | `"0p3n-w3bu!"`                      | Pipelines server API key                       |
-| `owui_base_url`        | str  | `"http://openwebui:8080"`           | OWUI API base                                  |
-| `owui_api_key`         | str  | `""`                                | Bearer token for OWUI API                      |
-| `max_iterations`       | int  | `3`                                 | Hard cap on RAG expansion iterations           |
-| `fixed_iterations`     | int  | `2`                                 | Guaranteed iterations before continue-decision |
-| `top_k_per_collection` | int  | `5`                                 | Chunks retrieved per collection per query      |
-| `max_collections`      | int  | `10`                                | Max collections to search (LLM selects best)   |
-| `max_domains`          | int  | `5`                                 | Max domains to discover via web search         |
-| `include_sources`      | bool | `True`                              | Append source references to final answer       |
-| `fileshed_compatible`  | bool | `True`                              | Write journal to Fileshed Storage zone         |
-| `storage_base_path`    | str  | `"/app/backend/data/user_files"`    | Base path for Fileshed-compatible storage      |
-| `save_journal`         | bool | `True`                              | Persist research journal to disk               |
+| Valve                  | Type | Default                             | Description                                                                    |
+| ---------------------- | ---- | ----------------------------------- | ------------------------------------------------------------------------------ |
+| `smolcrawl_url`        | str  | `"http://smolcrawl-pipelines:9099"` | SmolCrawl pipeline container URL                                               |
+| `smolcrawl_api_key`    | str  | `"0p3n-w3bu!"`                      | Pipelines server API key                                                       |
+| `owui_base_url`        | str  | `"http://openwebui:8080"`           | OWUI API base                                                                  |
+| `owui_api_key`         | str  | `""`                                | Bearer token for OWUI API                                                      |
+| `max_iterations`       | int  | `3`                                 | Hard cap on RAG expansion iterations                                           |
+| `fixed_iterations`     | int  | `2`                                 | Guaranteed iterations before continue-decision                                 |
+| `max_web_results`      | int  | `10`                                | Max web search results to store per query (research + deep_research discovery) |
+| `top_k_per_collection` | int  | `5`                                 | Chunks retrieved per collection per query                                      |
+| `max_collections`      | int  | `10`                                | Max collections to search (LLM selects best)                                   |
+| `max_domains`          | int  | `5`                                 | Max domains to discover via web search                                         |
+| `include_sources`      | bool | `True`                              | Append source references to final answer                                       |
+| `fileshed_compatible`  | bool | `True`                              | Write journal to Fileshed Storage zone                                         |
+| `storage_base_path`    | str  | `"/app/backend/data/user_files"`    | Base path for Fileshed-compatible storage                                      |
+| `save_journal`         | bool | `True`                              | Persist research journal to disk                                               |
 
 ### API Endpoints Used
 
@@ -612,6 +911,16 @@ src/smolcrawl/
 ```
 
 ## Implementation Phases
+
+### Phase 0: Research (Quick Exploration)
+
+1. Scaffold `research()` method in `deep_research_function.py` with Fileshed journal init
+2. Implement web search via sub-agent (reuse `_run_sub_agent` with `web_search: True`)
+3. Implement source storage: parse web search results → write `sources/{domain}-{N}.md`
+4. Implement iterative expansion loop over Fileshed files (read sources → expand terms → re-search → store)
+5. Implement synthesis from Fileshed journal entries
+6. Add escalation suggestion logic (detect when crawl-backed research would add value)
+7. Test end-to-end: query → web search → iterate → synthesize → escalation hint
 
 ### Phase 1: Core Function Scaffold
 
