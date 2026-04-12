@@ -46,17 +46,6 @@ class Pipeline:
     async def on_shutdown(self):
         pass
 
-    def _test_stream(self) -> Generator[str, None, None]:
-        """Diagnostic: yield messages with delays to verify OWUI streaming."""
-        log = logging.getLogger("smolcrawl_pipeline")
-        for i in range(1, 6):
-            msg = f"Test message {i}/5 (t={i * 3}s)\n"
-            log.info("[test_stream] yielding: %s", msg.strip())
-            yield msg
-            time.sleep(3)
-        log.info("[test_stream] done")
-        yield "**Test complete.**\n"
-
     def pipe(
         self,
         user_message: str,
@@ -68,10 +57,6 @@ class Pipeline:
 
         Streams progress as markdown-formatted status updates.
         """
-        # Diagnostic: "test stream" triggers a simple delayed-yield test
-        if user_message.strip().lower() == "test stream":
-            return self._test_stream()
-
         url = self._extract_url(user_message)
         if not url:
             return ("Please provide a URL to crawl and a knowledge base name.\n\n"

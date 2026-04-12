@@ -202,9 +202,24 @@ class OwuiKnowledgeClient:
             Response dict.
         """
         body = {"file_id": file_id}
-        resp = self._request_with_retry(
-            "POST", f"/api/v1/knowledge/{kb_id}/file/add", json=body
-        )
+        try:
+            resp = self._request_with_retry(
+                "POST", f"/api/v1/knowledge/{kb_id}/file/add", json=body
+            )
+        except httpx.HTTPStatusError as e:
+            if e.response.status_code == 400:
+                detail = ""
+                try:
+                    detail = e.response.json().get("detail", "")
+                except Exception:
+                    detail = e.response.text
+                if "duplicate" in detail.lower():
+                    logger.info(
+                        f"File {file_id} has duplicate content in KB {kb_id}, "
+                        "treating as already indexed"
+                    )
+                    return {"duplicate": True}
+            raise
         if resp is None:
             raise RuntimeError(
                 f"Failed to add file {file_id} to KB {kb_id}"
@@ -314,15 +329,26 @@ class OwuiKnowledgeClient:
                 # Upload new file
                 file_id = self.upload_file(filename, content_bytes)
                 self.wait_for_processing(file_id)
-                self.add_file_to_knowledge_base(kb_id, file_id)
+                add_resp = self.add_file_to_knowledge_base(kb_id, file_id)
+                is_duplicate = isinstance(add_resp, dict) and add_resp.get("duplicate")
+
+                if is_duplicate:
+                    # Content already in vector DB; clean up the orphan upload
+                    try:
+                        self.delete_file(file_id)
+                    except Exception:
+                        pass
 
                 with self._lock:
                     new_manifest_files[page.url] = {
                         "content_hash": content_hash,
-                        "owui_file_id": file_id,
+                        "owui_file_id": file_id if not is_duplicate else None,
                         "last_updated": datetime.now(timezone.utc).isoformat(),
                     }
-                    result.uploaded += 1
+                    if is_duplicate:
+                        result.skipped += 1
+                    else:
+                        result.uploaded += 1
                     counter["current"] += 1
 
                 if on_progress:
@@ -467,7 +493,22 @@ class OwuiKnowledgeClient:
 
                 return resp.json()
 
-            except (httpx.HTTPStatusError, httpx.RequestError) as e:
+            except httpx.HTTPStatusError as e:
+                last_error = e
+                # Don't retry client errors (4xx) — they won't succeed
+                if e.response.status_code < 500:
+                    raise
+                if attempt < self.config.retry_attempts - 1:
+                    backoff = self.config.retry_backoff_base * (2 ** attempt)
+                    backoff = min(backoff, 5.0)
+                    logger.warning(
+                        f"Request {method} {path} failed (attempt "
+                        f"{attempt + 1}/{self.config.retry_attempts}): {e}. "
+                        f"Retrying in {backoff:.1f}s"
+                    )
+                    time.sleep(backoff)
+
+            except httpx.RequestError as e:
                 last_error = e
                 if attempt < self.config.retry_attempts - 1:
                     backoff = self.config.retry_backoff_base * (2 ** attempt)
