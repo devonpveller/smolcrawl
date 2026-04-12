@@ -12,25 +12,28 @@ from typing import Any, Callable, Dict, List, Optional
 
 from .journal import ResearchJournal
 from .models import ResearchPhase, ResearchSession, Valves
-from .sub_agent import SubAgent
+from .sub_agent import SubAgent, extract_anchor
 from .synthesis import Synthesizer
 
 logger = logging.getLogger("deep_research.research")
 
 _WEB_SEARCH_SYSTEM_PROMPT = """\
 You are a research assistant. Search the web for authoritative information \
-about the given topic. For each relevant result, provide:
+about the given topic.
+
+IMPORTANT: Cover ALL specific concepts, terms, and proper nouns mentioned \
+in the query. If the query mentions a specific technique, framework, or \
+term, ensure at least some results address that term directly — do not \
+substitute a broader or adjacent topic.
 
 Return a JSON array of objects:
-[
-  {
-    "url": "https://...",
-    "domain": "docs.example.com",
-    "title": "Page Title",
-    "summary": "2-3 sentence summary of the key content",
-    "relevance": 0.0-1.0
-  }
-]
+[{{
+  "url": "https://...",
+  "domain": "docs.example.com",
+  "title": "Page Title",
+  "summary": "2-3 sentence summary of the key content",
+  "relevance": 0.0-1.0
+}}]
 
 Focus on official documentation, technical references, and authoritative \
 sources. Return at most {max_results} results.
@@ -38,32 +41,27 @@ Respond ONLY with valid JSON.\
 """
 
 _ANALYSIS_SYSTEM_PROMPT = """\
-You are a research analyst. Given a collection of web search findings, \
-produce a structured analysis including:
+Analyze collected web sources against the RESEARCH ANCHOR provided.
 
-1. A 2-3 paragraph summary of key findings
-2. Knowledge gaps that remain
-3. New concepts or terms discovered
+1. Summarize what the sources cover well.
+2. Identify which specific aspects of the ORIGINAL query are NOT yet \
+addressed (gaps). Be precise — quote the user's words.
+3. Suggest search terms that would specifically fill those gaps.
 
-Return a JSON object:
-{
-  "summary": "overall summary text",
-  "gaps": ["gap1", "gap2"],
-  "new_terms": ["term1", "term2"],
-  "new_concepts": ["concept1", "concept2"]
-}\
+Return JSON:
+{{"summary":"2-3 paragraphs","gaps":["specific unaddressed aspects"],"covered_aspects":["aspects well-covered"],"new_terms":["terms targeting the gaps"],"new_concepts":["concepts discovered"]}}\
 """
 
 _FILESHED_EXPANSION_SYSTEM_PROMPT = """\
-You are a research assistant reviewing stored findings. Given the original \
-query and accumulated sources, suggest new search terms that would surface \
-different, relevant information.
+Given findings so far and the RESEARCH ANCHOR, identify what aspects of \
+the query are still NOT adequately covered.
 
-Return a JSON object:
-{
-  "terms": ["term1", "term2", "term3"],
-  "rationale": "brief explanation of why these terms would help"
-}\
+Prioritize search terms that fill gaps in coverage of the original query.
+Do NOT drift toward tangential topics — stay focused on what the user \
+specifically asked about. Include the user's own terminology.
+
+Return JSON:
+{{"terms":["term1","term2"],"rationale":"why these fill gaps","uncovered_aspects":["aspects still needing coverage"]}}\
 """
 
 
@@ -123,6 +121,15 @@ class QuickResearcher:
         self._journal.write_prompt(session, model_id)
         await self._emit_status(
             event_emitter, "📋 Research session started"
+        )
+
+        # Extract anchor once — threads through all subsequent prompts
+        session.anchor = await extract_anchor(
+            self._sub_agent, query, request, user
+        )
+        self._journal.write_anchor(session)
+        await self._emit_status(
+            event_emitter, "🎯 Research anchor extracted"
         )
 
         # Step 1: Web search + store sources
@@ -317,14 +324,14 @@ class QuickResearcher:
                         source_content.append(f.read())
 
         if not source_content:
-            return {"summary": "No sources found.", "gaps": [], "new_terms": []}
+            return {"summary": "No sources found.", "gaps": ["entire query uncovered"], "new_terms": [], "covered_aspects": []}
 
         try:
             return await self._sub_agent.run_json(
                 system_prompt=_ANALYSIS_SYSTEM_PROMPT,
                 user_prompt=(
-                    f"Original query: {session.query}\n\n"
-                    f"Collected sources:\n\n"
+                    f"{session.anchor}\n\n"
+                    f"Sources ({len(source_content)}):\n\n"
                     + "\n\n---\n\n".join(source_content[:15])
                 ),
                 request=request,
@@ -351,7 +358,7 @@ class QuickResearcher:
             result = await self._sub_agent.run_json(
                 system_prompt=_FILESHED_EXPANSION_SYSTEM_PROMPT,
                 user_prompt=(
-                    f"Query: {session.query}\n"
+                    f"{session.anchor}\n"
                     f"Current terms: {', '.join(current_terms)}\n"
                     f"Progress:\n{iteration_summaries}"
                 ),
@@ -383,7 +390,7 @@ class QuickResearcher:
             result = await self._sub_agent.run_json(
                 system_prompt=_CONTINUE_SYSTEM_PROMPT,
                 user_prompt=(
-                    f"Query: {session.query}\n\n"
+                    f"{session.anchor}\n\n"
                     f"Iterations:\n{iteration_text}"
                 ),
                 request=request,

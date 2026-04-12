@@ -110,6 +110,7 @@ class ResearchSession:
     seen_chunk_keys: set = field(default_factory=set)
     created_at: datetime = field(default_factory=datetime.utcnow)
     model_id: str = ""
+    anchor: str = ""
 
     def add_seen_chunk(self, collection_id: str, chunk_hash: str) -> bool:
         key = (collection_id, chunk_hash)
@@ -156,6 +157,12 @@ class _Journal:
             f"# Research Session\n\n**Query:** {session.query}\n"
             f"**Timestamp:** {session.created_at.isoformat()}\n"
             f"**Model:** {model_id}\n**Session ID:** {session.session_id}\n")
+
+    def write_anchor(self, session: ResearchSession) -> None:
+        self.write_entry(session.session_dir, "00-anchor.md",
+            f"# Research Anchor\n\n```\n{session.anchor}\n```\n\n"
+            f"This anchor was extracted at session start and is threaded through "
+            f"every search, analysis, and synthesis prompt to prevent drift.\n")
 
     def write_domains(self, session: ResearchSession, existing: List[Dict]) -> None:
         lines = ["# Domain Discovery\n"]
@@ -216,6 +223,42 @@ class _Journal:
 # =============================================================================
 #  Sub-Agent (internal LLM calls)
 # =============================================================================
+
+
+_ANCHOR_PROMPT = """\
+Extract a structured research anchor from the user's query.
+This anchor will guide all subsequent search, analysis, and synthesis steps.
+
+Return JSON:
+{"key_concepts": ["specific concepts/terms the user mentioned"],
+ "intent": "one sentence: what the user wants to learn or accomplish",
+ "scope_in": ["topics that ARE in scope"],
+ "scope_out": ["adjacent topics that are NOT being asked about"],
+ "must_cover": ["terms/phrases from the query that MUST appear in results"]}
+
+Be precise — use the user's exact words. Do NOT generalize or broaden.\
+"""
+
+
+async def _extract_anchor(sa: '_SubAgent', query: str, request, user: Dict) -> str:
+    """Run one LLM call to distil the query into a reusable anchor block."""
+    try:
+        r = await sa.run_json(_ANCHOR_PROMPT, query, request, user)
+    except Exception:
+        # Fallback: just wrap the raw query
+        return f"RESEARCH ANCHOR\nQuery: {query}\nKey concepts: (extraction failed — use query as-is)"
+    lines = ["RESEARCH ANCHOR", f"Query: {query}"]
+    if r.get("key_concepts"):
+        lines.append(f"Key concepts: {', '.join(r['key_concepts'])}")
+    if r.get("intent"):
+        lines.append(f"Intent: {r['intent']}")
+    if r.get("must_cover"):
+        lines.append(f"Must cover: {', '.join(r['must_cover'])}")
+    if r.get("scope_in"):
+        lines.append(f"In scope: {', '.join(r['scope_in'])}")
+    if r.get("scope_out"):
+        lines.append(f"Out of scope: {', '.join(r['scope_out'])}")
+    return "\n".join(lines)
 
 
 class _SubAgent:
@@ -279,11 +322,15 @@ _DISCOVERY_PROMPT = """\
 You are a research librarian. Given a research topic, search the web to \
 identify the most authoritative documentation sources.
 
+IMPORTANT: Cover ALL specific concepts mentioned in the query. If the \
+user mentions a specific term, technique, or proper noun, find sources \
+that address it directly — do not substitute broader topics.
+
 Return a JSON array of objects, each with:
 - "url": full URL of the documentation root
 - "domain": the domain name
 - "score": relevance 0.0-1.0
-- "rationale": one-sentence explanation
+- "rationale": one-sentence explanation of how this addresses the query
 
 Focus on: official docs, API references, tutorials, community wikis.
 Exclude: social media, forums, video-only, paywalled sites.
@@ -456,15 +503,24 @@ class _CrawlClient:
 # =============================================================================
 
 _EXPANSION_PROMPT = """\
-You are a research assistant analyzing RAG retrieval results. Given the \
-original query and findings so far, identify adjacent concepts and new terms.
+You are a research assistant analyzing RAG retrieval results.
 
-Return JSON: {"terms": ["term1","term2"], "concepts": ["c1","c2"], "summary": "2-3 paragraph summary"}\
+Compare the retrieved content against the ORIGINAL query. Identify:
+1. What aspects of the query these results address well
+2. What specific aspects of the original query remain UNCOVERED
+3. New search terms that target the uncovered aspects (use the user’s terminology)
+4. Adjacent concepts discovered that are still relevant to the original query
+
+Return JSON: {"terms": ["terms targeting gaps"], "concepts": ["relevant concepts found"], "summary": "2-3 paragraph summary", "uncovered": ["aspects of original query not yet addressed"]}\
 """
 
 _CONTINUE_PROMPT = """\
-Evaluate whether another research iteration would yield meaningful new info. \
-Return JSON: {"continue": true/false, "rationale": "one sentence"}\
+Evaluate whether another research iteration would be valuable.
+Continue if: key aspects of the original query remain uncovered, OR \
+promising new terms haven’t been explored yet.
+Stop if: the original query’s main concepts are well-covered.
+
+Return JSON: {"continue": true/false, "rationale": "one sentence", "uncovered": ["remaining gaps if any"]}\
 """
 
 
@@ -513,7 +569,7 @@ class _RagResearcher:
             ctx = "\n\n---\n\n".join(f"**[{c.collection_name}]** ({c.source})\n{c.content}" for c in new_chunks[:20])
             try:
                 r = await self._sa.run_json(_EXPANSION_PROMPT,
-                    f"Original query: {session.query}\nTerms: {', '.join(terms)}\n\nRetrieved ({len(new_chunks)} chunks):\n\n{ctx}",
+                    f"{session.anchor}\n\nSearch terms used: {', '.join(terms)}\n\nRetrieved ({len(new_chunks)} new chunks):\n\n{ctx}",
                     request, user)
                 summary = r.get("summary", "")
                 concepts = r.get("concepts", [])
@@ -529,7 +585,7 @@ class _RagResearcher:
         sums = "\n".join(f"Iteration {i.iteration_number}: {i.summary}" for i in session.iterations)
         try:
             r = await self._sa.run_json(_EXPANSION_PROMPT,
-                f"Query: {session.query}\nPrevious terms: {', '.join(current)}\nFindings:\n{sums}\nSuggest new terms.",
+                f"{session.anchor}\n\nPrevious terms: {', '.join(current)}\nFindings:\n{sums}\n\nSuggest new search terms that address uncovered aspects per the anchor above.",
                 request, user)
             return r.get("terms", current)
         except Exception:
@@ -538,7 +594,7 @@ class _RagResearcher:
     async def should_continue(self, session: ResearchSession, request, user: Dict) -> bool:
         sums = "\n".join(f"Iter {i.iteration_number}: new={i.new_chunks}, concepts={', '.join(i.new_concepts)}" for i in session.iterations)
         try:
-            r = await self._sa.run_json(_CONTINUE_PROMPT, f"Query: {session.query}\n\n{sums}", request, user)
+            r = await self._sa.run_json(_CONTINUE_PROMPT, f"{session.anchor}\n\n{sums}", request, user)
             return bool(r.get("continue", False))
         except Exception:
             return False
@@ -622,19 +678,39 @@ class _Synthesizer:
 # =============================================================================
 
 _WEB_SEARCH_PROMPT = """\
-Search the web for authoritative information about the topic.
+Search the web for authoritative information about the topic below.
+
+IMPORTANT: Cover ALL specific concepts, terms, and proper nouns mentioned \
+in the query. If the query mentions a specific technique, framework, or \
+term, ensure at least some results address that term directly — do not \
+substitute a broader or adjacent topic.
+
 Return JSON array: [{{"url":"...","domain":"...","title":"...","summary":"2-3 sentences","relevance":0.0-1.0}}]
 Return at most {max_results} results. Respond ONLY with valid JSON.\
 """
 
 _ANALYSIS_PROMPT = """\
-Analyze collected web sources. Return JSON:
-{{"summary":"2-3 paragraphs","gaps":["..."],"new_terms":["..."],"new_concepts":["..."]}}\
+Analyze collected web sources against the ORIGINAL research query.
+
+1. Summarize what the sources cover well.
+2. Identify which specific aspects of the ORIGINAL query are NOT yet \
+addressed (gaps). Be precise — quote the user’s words.
+3. Suggest search terms that would specifically fill those gaps.
+
+Return JSON:
+{{"summary":"2-3 paragraphs","gaps":["specific unaddressed aspects of the original query"],"covered_aspects":["aspects well-covered"],"new_terms":["terms targeting the gaps, anchored to original query"],"new_concepts":["concepts discovered"]}}\
 """
 
 _EXPAND_PROMPT = """\
-Given findings so far, suggest new search terms. Return JSON:
-{{"terms":["term1","term2"],"rationale":"explanation"}}\
+Given findings so far and the ORIGINAL query, identify what aspects of \
+the query are still NOT adequately covered.
+
+Prioritize search terms that fill gaps in coverage of the original query.
+Do NOT drift toward tangential topics — stay focused on what the user \
+specifically asked about. Include the user’s own terminology.
+
+Return JSON:
+{{"terms":["term1","term2"],"rationale":"why these fill gaps","uncovered_aspects":["aspects still needing coverage"]}}\
 """
 
 
@@ -652,17 +728,28 @@ class _QuickResearcher:
         self._j.write_prompt(session, model_id)
         await _emit(emitter, "📋 Research session started")
 
+        # Extract anchor once — threads through all subsequent prompts
+        session.anchor = await _extract_anchor(self._sa, query, request, user)
+        self._j.write_anchor(session)
+        await _emit(emitter, "🎯 Research anchor extracted")
+
+        total_sources = 0
         session.phase = ResearchPhase.RESEARCHING
         sources = await self._web_search(query, request, user)
         await self._store_sources(session, sources)
-        await _emit(emitter, f"🌐 Found {len(sources)} source(s)")
+        total_sources += len(sources)
+        await _emit(emitter, f"🌐 {total_sources} source(s) found")
 
         analysis = await self._analyze(session, request, user)
+        gaps = analysis.get("gaps", [])
         terms = [query] + analysis.get("new_terms", [])
         it = IterationResult(1, [query], ["web_search"], len(sources), len(sources),
                              analysis.get("summary", ""), analysis.get("new_concepts", []))
         session.iterations.append(it)
         self._j.write_iteration(session, it)
+
+        if gaps:
+            await _emit(emitter, f"🔍 Gaps: {', '.join(gaps[:3])}")
 
         seen = {s.get("url", "") for s in sources}
         for n in range(2, self._v.max_iterations + 1):
@@ -674,17 +761,20 @@ class _QuickResearcher:
             if new_src:
                 await self._store_sources(session, new_src)
                 seen.update(s.get("url", "") for s in new_src)
+                total_sources += len(new_src)
             analysis2 = await self._analyze(session, request, user)
+            gaps = analysis2.get("gaps", [])
             it2 = IterationResult(n, new_t, ["web_search"], len(new_src), len(new_src),
                                   analysis2.get("summary", ""), analysis2.get("new_concepts", []))
             session.iterations.append(it2)
             self._j.write_iteration(session, it2)
             terms += new_t
-            await _emit(emitter, f"🔄 Expanding: {', '.join(new_t[:3])}")
+            gap_hint = f" | Gaps: {', '.join(gaps[:2])}" if gaps else ""
+            await _emit(emitter, f"🔄 Iter {n}: +{len(new_src)} source(s), {total_sources} total{gap_hint}")
             if n >= self._v.fixed_iterations:
                 try:
-                    r = await self._sa.run_json(_CONTINUE_PROMPT, f"Query: {query}\nIters: " +
-                        "\n".join(f"Iter {i.iteration_number}: {i.new_chunks} sources" for i in session.iterations), request, user)
+                    r = await self._sa.run_json(_CONTINUE_PROMPT, f"{session.anchor}\nIters:\n" +
+                        "\n".join(f"Iter {i.iteration_number}: {i.new_chunks} sources, summary: {i.summary[:100]}" for i in session.iterations), request, user)
                     if not r.get("continue", False):
                         break
                 except Exception:
@@ -734,18 +824,18 @@ class _QuickResearcher:
                     with open(fp, "r", encoding="utf-8") as f:
                         texts.append(f.read())
         if not texts:
-            return {"summary": "No sources.", "gaps": [], "new_terms": []}
+            return {"summary": "No sources.", "gaps": ["entire query uncovered"], "new_terms": [], "covered_aspects": []}
         try:
             return await self._sa.run_json(_ANALYSIS_PROMPT,
-                f"Query: {session.query}\n\nSources:\n\n" + "\n\n---\n\n".join(texts[:15]), request, user)
+                f"{session.anchor}\n\nSources ({len(texts)}):\n\n" + "\n\n---\n\n".join(texts[:15]), request, user)
         except Exception:
-            return {"summary": f"Found {len(texts)} sources.", "gaps": [], "new_terms": []}
+            return {"summary": f"Found {len(texts)} sources.", "gaps": [], "new_terms": [], "covered_aspects": []}
 
     async def _expand(self, session, terms, request, user):
         sums = "\n".join(f"- Iter {i.iteration_number}: {i.summary[:200]}" for i in session.iterations)
         try:
             r = await self._sa.run_json(_EXPAND_PROMPT,
-                f"Query: {session.query}\nCurrent: {', '.join(terms)}\n{sums}", request, user)
+                f"{session.anchor}\nCurrent search terms: {', '.join(terms)}\nFindings so far:\n{sums}", request, user)
             return r.get("terms", [])
         except Exception:
             return []
@@ -842,6 +932,11 @@ class Tools:
         session = ResearchSession(session_id=str(_uuid.uuid4()), query=query, session_dir=sdir, model_id=mid)
         j.write_prompt(session, mid)
         await _emit(__event_emitter__, "📋 Deep research started")
+
+        # Extract anchor once — threads through all subsequent prompts
+        session.anchor = await _extract_anchor(sa, query, __request__, __user__ or {})
+        j.write_anchor(session)
+        await _emit(__event_emitter__, "🎯 Research anchor extracted")
 
         # --- Phase 1: Discover domains and check existing collections ---
         session.phase = ResearchPhase.DISCOVERING

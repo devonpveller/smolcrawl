@@ -7,7 +7,8 @@ Dependency Inversion: Depends on OWUI's generate_chat_completion abstraction.
 
 import json
 import logging
-from typing import Any, Dict, Optional
+import re
+from typing import Any, Dict, List, Optional
 
 logger = logging.getLogger("deep_research.sub_agent")
 
@@ -161,3 +162,50 @@ class SubAgent:
             or (model or {}).get("id", "")
         )
         return model_id
+
+
+# ---- Anchor extraction ----
+
+_ANCHOR_PROMPT = """\
+Extract a structured research anchor from the user's query.
+This anchor will guide all subsequent search, analysis, and synthesis steps.
+
+Return JSON:
+{"key_concepts": ["specific concepts/terms the user mentioned"],
+ "intent": "one sentence: what the user wants to learn or accomplish",
+ "scope_in": ["topics that ARE in scope"],
+ "scope_out": ["adjacent topics that are NOT being asked about"],
+ "must_cover": ["terms/phrases from the query that MUST appear in results"]}
+
+Be precise — use the user's exact words. Do NOT generalize or broaden.\
+"""
+
+
+async def extract_anchor(sa: SubAgent, query: str, request: Any, user: Dict) -> str:
+    """Run one LLM call to distil the query into a reusable anchor block.
+
+    Args:
+        sa: SubAgent for LLM calls.
+        query: Raw user query.
+        request: OWUI __request__ object.
+        user: OWUI __user__ dict.
+
+    Returns:
+        Multi-line anchor string to prepend to every prompt.
+    """
+    try:
+        r = await sa.run_json(_ANCHOR_PROMPT, query, request, user)
+    except Exception:
+        return f"RESEARCH ANCHOR\nQuery: {query}\nKey concepts: (extraction failed \u2014 use query as-is)"
+    lines = ["RESEARCH ANCHOR", f"Query: {query}"]
+    if r.get("key_concepts"):
+        lines.append(f"Key concepts: {', '.join(r['key_concepts'])}")
+    if r.get("intent"):
+        lines.append(f"Intent: {r['intent']}")
+    if r.get("must_cover"):
+        lines.append(f"Must cover: {', '.join(r['must_cover'])}")
+    if r.get("scope_in"):
+        lines.append(f"In scope: {', '.join(r['scope_in'])}")
+    if r.get("scope_out"):
+        lines.append(f"Out of scope: {', '.join(r['scope_out'])}")
+    return "\n".join(lines)

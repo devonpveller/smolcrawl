@@ -16,31 +16,25 @@ from .sub_agent import SubAgent
 logger = logging.getLogger("deep_research.rag_research")
 
 _EXPANSION_SYSTEM_PROMPT = """\
-You are a research assistant analyzing RAG retrieval results. Given the \
-original research query and a summary of findings so far, identify \
-adjacent concepts, synonyms, and related terms that should be searched \
-to find additional relevant information.
+You are a research assistant analyzing RAG retrieval results.
 
-Return a JSON object with:
-- "terms": array of 3-5 new search terms/phrases
-- "concepts": array of new concepts discovered in the findings
-- "summary": a 2-3 paragraph summary of what was found so far
+Compare the retrieved content against the RESEARCH ANCHOR provided.
+Identify:
+1. What aspects of the query these results address well
+2. What specific aspects of the original query remain UNCOVERED
+3. New search terms that target the uncovered aspects (use the user's terminology)
+4. Adjacent concepts discovered that are still relevant to the original query
 
-Respond ONLY with valid JSON.\
+Return JSON: {"terms": ["terms targeting gaps"], "concepts": ["relevant concepts found"], "summary": "2-3 paragraph summary", "uncovered": ["aspects of original query not yet addressed"]}\
 """
 
 _CONTINUE_SYSTEM_PROMPT = """\
-You are evaluating whether another research iteration would yield \
-meaningfully new information. Given the original query and summaries \
-from previous iterations, decide whether to continue.
+Evaluate whether another research iteration would be valuable.
+Continue if: key aspects of the original query remain uncovered, OR \
+promising new terms haven't been explored yet.
+Stop if: the original query's main concepts are well-covered.
 
-Consider:
-- Are there clear knowledge gaps remaining?
-- Did the last iteration introduce genuinely new concepts?
-- Would different search terms likely surface new content?
-
-Respond with a JSON object:
-{"continue": true/false, "rationale": "one sentence explanation"}\
+Return JSON: {"continue": true/false, "rationale": "one sentence", "uncovered": ["remaining gaps if any"]}\
 """
 
 
@@ -185,7 +179,7 @@ class RagResearcher:
                 result = await self._sub_agent.run_json(
                     system_prompt=_EXPANSION_SYSTEM_PROMPT,
                     user_prompt=(
-                        f"Original query: {session.query}\n\n"
+                        f"{session.anchor}\n\n"
                         f"Search terms used: {', '.join(search_terms)}\n\n"
                         f"Retrieved content ({len(new_chunks)} new chunks):\n\n"
                         f"{chunk_text}"
@@ -241,11 +235,11 @@ class RagResearcher:
             result = await self._sub_agent.run_json(
                 system_prompt=_EXPANSION_SYSTEM_PROMPT,
                 user_prompt=(
-                    f"Original query: {session.query}\n\n"
+                    f"{session.anchor}\n\n"
                     f"Previous search terms: {', '.join(current_terms)}\n\n"
                     f"Findings so far:\n{iteration_summaries}\n\n"
-                    f"Suggest new search terms that would find different, "
-                    f"relevant information."
+                    f"Suggest new search terms that address uncovered aspects "
+                    f"per the anchor above."
                 ),
                 request=request,
                 user=user,
@@ -282,7 +276,7 @@ class RagResearcher:
             result = await self._sub_agent.run_json(
                 system_prompt=_CONTINUE_SYSTEM_PROMPT,
                 user_prompt=(
-                    f"Original query: {session.query}\n\n"
+                    f"{session.anchor}\n\n"
                     f"Iteration results:\n{iteration_summaries}"
                 ),
                 request=request,

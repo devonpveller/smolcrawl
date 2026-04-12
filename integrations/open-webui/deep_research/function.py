@@ -23,7 +23,7 @@ from .models import (
 )
 from .rag_research import RagResearcher
 from .research import QuickResearcher
-from .sub_agent import SubAgent
+from .sub_agent import SubAgent, extract_anchor
 from .synthesis import Synthesizer
 
 logger = logging.getLogger("deep_research")
@@ -133,6 +133,15 @@ class Tools:
 
         await self._emit_status(
             __event_emitter__, "📋 Deep research started"
+        )
+
+        # Extract anchor once — threads through all subsequent prompts
+        session.anchor = await extract_anchor(
+            sub_agent, query, __request__, __user__ or {}
+        )
+        journal.write_anchor(session)
+        await self._emit_status(
+            __event_emitter__, "🎯 Research anchor extracted"
         )
 
         # --- Phase 1: Discover domains and check existing collections ---

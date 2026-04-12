@@ -133,6 +133,21 @@ class ResearchJournal:
         )
         self.write_entry(session.session_dir, "00-prompt.md", content)
 
+    def write_anchor(self, session: ResearchSession) -> None:
+        """Write the research anchor file (00-anchor.md).
+
+        The anchor is a structured extraction of the query's key concepts,
+        intent, and scope boundaries. It is threaded through every search,
+        analysis, and synthesis prompt to prevent research drift.
+        """
+        content = (
+            f"# Research Anchor\n\n"
+            f"```\n{session.anchor}\n```\n\n"
+            f"This anchor was extracted at session start and is threaded through "
+            f"every search, analysis, and synthesis prompt to prevent drift.\n"
+        )
+        self.write_entry(session.session_dir, "00-anchor.md", content)
+
     def write_domains(
         self,
         session: ResearchSession,

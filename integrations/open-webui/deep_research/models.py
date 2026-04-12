@@ -176,6 +176,7 @@ class ResearchSession:
     seen_chunk_keys: set = field(default_factory=set)
     created_at: datetime = field(default_factory=datetime.utcnow)
     model_id: str = ""
+    anchor: str = ""
 
     def add_seen_chunk(self, collection_id: str, chunk_hash: str) -> bool:
         """Track a chunk as seen. Returns True if it was new."""
