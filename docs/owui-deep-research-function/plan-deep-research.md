@@ -10,27 +10,37 @@ Additionally, the crawl process that _builds_ these knowledge collections is cur
 
 Two complementary components:
 
-1. **Deep Research Pipeline** (Open WebUI) — an OWUI Pipeline that intercepts queries, iteratively expands search terms across knowledge collections, and streams a synthesized answer with full provenance.
+1. **Deep Research Function** (Open WebUI) — an OWUI **Function** (`class Tools`) that the user's selected LLM invokes via native function calling. Iteratively expands search terms across knowledge collections, persists a research journal to Fileshed, and returns a synthesized chain-of-thought answer.
 2. **LLM-Guided Crawl Discovery** (SmolCrawl) — a crawl-time module that uses an LLM to evaluate discovered links and decide which adjacent domains to follow, expanding the crawl frontier intelligently.
 
 ```
-User Query
+User selects real LLM model + enables Deep Research function
     │
     ▼
-┌─────────────────────────────────┐
-│  Deep Research Pipeline (OWUI)  │
-│                                 │
-│  1. List all knowledge          │
-│     collections (OWUI API)      │
-│  2. LLM picks relevant ones     │
-│  3. Iteration loop:             │
-│     a. Query selected KBs       │
-│     b. LLM extracts new terms   │
-│     c. Re-query with expansions │
-│  4. Synthesize + stream answer  │
-└─────────────────────────────────┘
+┌──────────────────────────────────────────────────┐
+│  LLM (e.g. llama3:70b)                          │
+│  "The user wants deep research on X..."          │
+│  → calls deep_research(query="X")                │
+│                                                  │
+│  ┌────────────────────────────────────────────┐  │
+│  │  Deep Research Function (class Tools)      │  │
+│  │                                            │  │
+│  │  1. Init Fileshed journal                  │  │
+│  │  2. List collections → sub-agent ranks     │  │
+│  │  3. Iteration loop:                        │  │
+│  │     a. Query selected KBs (OWUI API)       │  │
+│  │     b. Sub-agent extracts new terms        │  │
+│  │     c. Write findings to Fileshed journal  │  │
+│  │     d. Read back summaries for next iter   │  │
+│  │  4. Sub-agent synthesizes via CoT          │  │
+│  │  5. Return answer to outer LLM             │  │
+│  └────────────────────────────────────────────┘  │
+│                                                  │
+│  LLM presents synthesized answer to user         │
+│  (can chain with Fileshed, Superpowers, etc.)    │
+└──────────────────────────────────────────────────┘
 
-SmolCrawl (build-time):
+SmolCrawl (build-time, separate Pipeline):
 ┌─────────────────────────────────┐
 │  LLM-Guided Crawl Discovery     │
 │                                 │
@@ -45,13 +55,154 @@ SmolCrawl (build-time):
 └─────────────────────────────────┘
 ```
 
-## Component 1: Deep Research Pipeline
+## Component 1: Deep Research
 
-### Architecture
+### LLM Engagement Architecture (Critical Design Decision)
 
-The pipeline is an OWUI **Pipeline** (intercepts messages, streams responses). It lives alongside the existing SmolCrawl Knowledge Builder pipeline but serves the opposite direction: _reading_ from knowledge collections instead of _writing_ to them.
+Open WebUI has two extension types with fundamentally different LLM access:
 
-**Activation**: User prefixes query with a trigger phrase (e.g., `deep research: <query>` or `/research <query>`).
+| Type              | Class                           | LLM Present?                                 | User Selects As                 | Can Call Tools?              |
+| ----------------- | ------------------------------- | -------------------------------------------- | ------------------------------- | ---------------------------- |
+| **Pipeline**      | `class Pipeline` with `pipe()`  | **No** — pipeline _replaces_ the model       | A "model" in the model dropdown | No — it IS the model         |
+| **Function/Tool** | `class Tools` with tool methods | **Yes** — runs inside a real model's context | Enabled alongside a model       | Yes — LLM calls the function |
+
+The existing SmolCrawl Knowledge Builder is a **Pipeline**: the user selects it as a "model", types `crawl https://... into My KB`, and the pipeline handles everything. No LLM is in the loop — which is fine for crawling, where the workflow is deterministic.
+
+Deep research **requires an LLM** for collection ranking, term expansion, continue-decisions, and synthesis. There are three approaches:
+
+#### Option A: Pipeline + Hardcoded Model Valve (Current SmolCrawl Pattern)
+
+The deep research pipeline replaces the model. A valve specifies which real LLM to call via `generate_chat_completion`. The pipeline orchestrates everything.
+
+```
+User selects "Deep Research" as model
+  → Pipeline intercepts message
+  → Pipeline calls LLM (specified in valve) via generate_chat_completion
+  → Pipeline streams results back
+```
+
+**Problem**: The user must configure a `model_id` valve and cannot use the model they already have selected. The pipeline is an island — it can't leverage other Functions/Tools the user has enabled (Fileshed, Superpowers).
+
+#### Option B: Function/Tool (Superpowers Pattern) ← RECOMMENDED
+
+Deep research is a **Function** (`class Tools`). The user selects a real LLM model and enables the deep research function alongside it. The LLM can call `deep_research(query)` natively.
+
+```
+User selects "llama3:70b" as model
+User enables: Deep Research, Fileshed, Superpowers (functions)
+  → User types: "deep research: how does Blueprint replication work?"
+  → LLM recognizes the tool call → invokes deep_research(query="...")
+  → Function runs the iterative loop internally (sub-agent calls for each step)
+  → Function returns structured result to the LLM
+  → LLM presents the synthesized answer to the user
+```
+
+**Advantages**:
+
+- LLM is present and engaged — it can reason about what to do
+- Other Functions/Tools are accessible: the deep research function can call Fileshed operations programmatically, and the LLM can call Superpowers before/after
+- The user doesn't need to switch "models" — they use their preferred LLM and toggle the function on
+- Native function calling means the LLM decides when to invoke deep research vs. answering directly
+- Matches the established pattern (Superpowers = `class Tools`, Fileshed = `class Tools`)
+
+**Sub-agent pattern unchanged**: Inside the `deep_research()` tool method, the function still calls `generate_chat_completion` with `bypass_filter=True` for each reasoning step (collection ranking, term expansion, synthesis). The difference is that the outer LLM orchestrates _when_ to invoke the function, and the function orchestrates the internal multi-step loop.
+
+#### Option C: Hybrid — Function for Research + Pipeline for Crawl
+
+Keep SmolCrawl Knowledge Builder as a Pipeline (it doesn't need an LLM). Make deep research a Function. They coexist independently.
+
+```
+Pipeline: SmolCrawl Knowledge Builder  → user selects as model to crawl
+Function: Deep Research                → user enables alongside a real model
+Function: Fileshed                     → persistence (shared by both)
+Function: Superpowers                  → spec/plan workflows
+```
+
+**This is the recommended architecture.** The crawl pipeline stays a pipeline (deterministic, no LLM needed). Deep research becomes a function (LLM-native, tool-calling, composable with other functions).
+
+#### Chosen Approach: Option C (Hybrid)
+
+```
+┌─────────────────────────────────────────────────────────┐
+│  User's Model Selection: e.g. "llama3:70b"              │
+│                                                         │
+│  Enabled Functions:                                     │
+│  ┌──────────────┐ ┌──────────┐ ┌──────────────────────┐│
+│  │ Deep Research │ │ Fileshed │ │ Superpowers          ││
+│  │ (class Tools) │ │ (Tools)  │ │ (Tools)              ││
+│  └──────┬───────┘ └─────┬────┘ └──────────┬───────────┘│
+│         │               │                  │            │
+│         │    ┌──────────┴──────────┐       │            │
+│         │    │ Shared Fileshed     │       │            │
+│         └───►│ Storage Zone        │◄──────┘            │
+│              │ deep-research/      │                    │
+│              │ superpowers/        │                    │
+│              └─────────────────────┘                    │
+│                                                         │
+│  Available Pipelines (separate model selection):        │
+│  ┌────────────────────────┐                             │
+│  │ SmolCrawl KB Builder   │ ← select as model to crawl │
+│  │ (class Pipeline)       │                             │
+│  └────────────────────────┘                             │
+└─────────────────────────────────────────────────────────┘
+```
+
+#### Function Signature
+
+```python
+class Tools:
+    class Valves(BaseModel):
+        max_iterations: int = 3
+        fixed_iterations: int = 2
+        top_k_per_collection: int = 5
+        max_collections: int = 10
+        owui_base_url: str = "http://openwebui:8080"
+        owui_api_key: str = ""
+        include_sources: bool = True
+        fileshed_compatible: bool = True
+        storage_base_path: str = "/app/backend/data/user_files"
+        save_journal: bool = True
+
+    def __init__(self):
+        self.valves = self.Valves()
+
+    async def deep_research(
+        self,
+        query: str,
+        __user__: dict = None,
+        __metadata__: dict = None,
+        __event_emitter__: typing.Callable[[dict], typing.Any] = None,
+        __request__=None,
+        __model__: dict = None,
+        __event_call__=None,
+        __chat_id__: str = "",
+        __message_id__: str = "",
+    ) -> str:
+        """
+        Perform deep iterative research across all OWUI knowledge collections.
+        Expands search terms using LLM reasoning to find context the user
+        might not know to search for. Returns a synthesized answer with sources.
+
+        Args:
+            query: The research question or topic to investigate.
+        """
+        # 1. Initialize Fileshed journal
+        # 2. List + rank collections (sub-agent call)
+        # 3. Iterative RAG loop with term expansion (sub-agent calls)
+        # 4. Chain-of-thought synthesis (sub-agent call)
+        # 5. Return result to the outer LLM
+```
+
+The `__event_emitter__` provides streaming status updates to the user during the research loop (same mechanism Superpowers uses). The final return value is the synthesized answer, which the outer LLM can then present or build upon.
+
+#### How the Outer LLM Engages
+
+With native function calling enabled, the LLM sees the `deep_research()` tool description and can:
+
+1. **Auto-invoke**: User says "research how Blueprint replication works" → LLM calls `deep_research(query="Blueprint replication")`
+2. **Contextualize results**: The function returns the synthesis → the LLM can add its own commentary, answer follow-ups, or feed results into Superpowers
+3. **Chain with other tools**: LLM calls `deep_research()`, then calls `shed_patch_text()` to save a summary, then calls `brainstorm()` to start a spec — all in one conversation
+4. **Decide NOT to invoke**: For simple questions the LLM can answer directly, it skips deep research entirely
 
 ### Iteration Model
 
@@ -118,9 +269,10 @@ Step 5 — Chain-of-Thought Synthesis
 
 ### Valve Configuration
 
+No `trigger_prefix` needed — the LLM decides when to call `deep_research()` based on the tool description and native function calling.
+
 | Valve                  | Type | Default                          | Description                                    |
 | ---------------------- | ---- | -------------------------------- | ---------------------------------------------- |
-| `trigger_prefix`       | str  | `"deep research:"`               | Message prefix that activates the pipeline     |
 | `max_iterations`       | int  | `3`                              | Hard cap on expansion iterations               |
 | `fixed_iterations`     | int  | `2`                              | Guaranteed iterations before continue-decision |
 | `top_k_per_collection` | int  | `5`                              | Chunks retrieved per collection per query      |
@@ -140,29 +292,40 @@ Step 5 — Chain-of-Thought Synthesis
 | `/api/v1/knowledge/{id}`  | GET    | Get collection metadata        |
 | `/api/v1/retrieval/query` | POST   | RAG query against a collection |
 
-### Sub-Agent Pattern
+### Sub-Agent Pattern (Internal LLM Calls)
 
-Following the pattern established by **Superpowers** (`_run_sub_agent`), each LLM call (collection ranking, term expansion, continue-decision, synthesis) is a sub-agent invocation using `generate_chat_completion` with `bypass_filter=True`. This avoids recursive pipeline triggering and allows the pipeline to use the user's currently selected model.
+The `deep_research()` tool method needs to make multiple internal LLM calls (collection ranking, term expansion, continue-decision, synthesis). These use `generate_chat_completion` with `bypass_filter=True` — the same pattern Superpowers uses in `_run_sub_agent`.
+
+Because deep research is a **Function** (not a Pipeline), it runs inside the context of the user's selected model and receives `__metadata__` containing the active `model_id`. Sub-agent calls reuse that same model:
 
 ```python
-# Pattern from Superpowers — reused for all LLM calls
-from open_webui.utils.chat import generate_chat_completion
-from open_webui.models.users import UserModel
+async def _run_sub_agent(self, system_prompt, user_prompt, __request__, __user__, __metadata__, __model__):
+    from open_webui.utils.chat import generate_chat_completion
+    from open_webui.models.users import UserModel
 
-response = await generate_chat_completion(
-    request=__request__,
-    form_data={
-        "model": model_id,
-        "messages": [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_prompt},
-        ],
-        "stream": False,
-        "metadata": {"task": "deep_research_sub_agent"},
-    },
-    user=UserModel(**__user__),
-    bypass_filter=True,
-)
+    model_id = ((__metadata__ or {}).get("model") or {}).get("id", "") or (
+        __model__ or {}
+    ).get("id", "")
+
+    response = await generate_chat_completion(
+        request=__request__,
+        form_data={
+            "model": model_id,
+            "messages": [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ],
+            "stream": False,
+            "metadata": {"task": "deep_research_sub_agent"},
+        },
+        user=UserModel(**__user__),
+        bypass_filter=True,  # Prevents recursive function/filter invocation
+    )
+    return response["choices"][0]["message"]["content"]
+```
+
+The `bypass_filter=True` flag is critical — without it, the sub-agent call could re-trigger the deep research function, Superpowers, or other filters in an infinite loop.
+
 ```
 
 ### Fileshed as Research Journal (Working Memory)
@@ -177,16 +340,18 @@ Fileshed is **not** a final-step report dump. It is the pipeline's **active work
 Each research session creates a directory under the user's Fileshed Storage zone:
 
 ```
+
 {STORAGE_BASE_PATH}/users/{user_id}/Storage/data/deep-research/
 └── {timestamp}-{slug}/
-    ├── 00-prompt.md           ← Original user query + goal context
-    ├── 01-collections.md      ← Selected collections + LLM ranking rationale
-    ├── 02-iteration-1.md      ← Search terms, retrieved chunks, LLM summary
-    ├── 03-iteration-2.md      ← Expanded terms, new chunks, LLM summary
-    ├── 04-iteration-3.md      ← (if continue-decision = YES)
-    ├── 05-synthesis.md         ← Final chain-of-thought synthesis
-    └── manifest.json           ← Machine-readable index of all files
-```
+├── 00-prompt.md ← Original user query + goal context
+├── 01-collections.md ← Selected collections + LLM ranking rationale
+├── 02-iteration-1.md ← Search terms, retrieved chunks, LLM summary
+├── 03-iteration-2.md ← Expanded terms, new chunks, LLM summary
+├── 04-iteration-3.md ← (if continue-decision = YES)
+├── 05-synthesis.md ← Final chain-of-thought synthesis
+└── manifest.json ← Machine-readable index of all files
+
+````
 
 #### What Gets Written at Each Step
 
@@ -249,7 +414,7 @@ def _resolve_session_dir(self, user_id: str, slug: str) -> str:
         self.valves.storage_base_path,
         "deep-research", session_name
     )
-```
+````
 
 #### User Visibility
 
@@ -297,8 +462,8 @@ docs/owui-deep-research-function/
 └── reference-owui-retrieval-api.md ← OWUI retrieval API patterns
 
 integrations/open-webui/
-├── smolcrawl_pipeline.py          ← existing crawl pipeline (unchanged)
-└── deep_research_pipeline.py      ← NEW: deep research pipeline
+├── smolcrawl_pipeline.py          ← existing crawl Pipeline (unchanged)
+└── deep_research_function.py      ← NEW: deep research Function (class Tools)
 
 src/smolcrawl/
 ├── crawl.py                       ← modified: LLM link evaluation hook
@@ -310,14 +475,16 @@ src/smolcrawl/
 
 ### Phase 1: Deep Research Pipeline (OWUI)
 
-1. Scaffold `deep_research_pipeline.py` with Valves, trigger detection
-2. Implement Fileshed journal initialization (`_resolve_session_dir`, `_write_journal_entry`)
-3. Implement collection listing + LLM ranking → write `01-collections.md`
-4. Implement RAG query loop with term expansion → write iteration files
-5. Implement continue-decision logic with journal read-back
-6. Implement chain-of-thought synthesis from journal entries → write `05-synthesis.md`
-7. Implement streaming with progress + abbreviated CoT + final answer
-8. Docker integration (add to existing `docker-compose.yml`)
+1. Scaffold `deep_research_function.py` as `class Tools` with Valves
+2. Implement `deep_research()` tool method with `__event_emitter__` streaming
+3. Implement `_run_sub_agent()` for internal LLM calls (reuse Superpowers pattern)
+4. Implement Fileshed journal initialization (`_resolve_session_dir`, `_write_journal_entry`)
+5. Implement collection listing + LLM ranking → write `01-collections.md`
+6. Implement RAG query loop with term expansion → write iteration files
+7. Implement continue-decision logic with journal read-back
+8. Implement chain-of-thought synthesis from journal entries → write `05-synthesis.md`
+9. Streaming status via `__event_emitter__` + final return to outer LLM
+10. Docker integration (add to existing `docker-compose.yml`)
 
 ### Phase 2: LLM-Guided Crawl Discovery (SmolCrawl)
 
