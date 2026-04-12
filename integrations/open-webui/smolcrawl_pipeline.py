@@ -8,6 +8,7 @@ description: Crawl a website, augment markdown for RAG, and upload to an OWUI kn
 requirements: httpx, markdownify, readabilipy, beautifulsoup4, lxml
 """
 
+import logging
 import queue
 import re
 import threading
@@ -45,6 +46,17 @@ class Pipeline:
     async def on_shutdown(self):
         pass
 
+    def _test_stream(self) -> Generator[str, None, None]:
+        """Diagnostic: yield messages with delays to verify OWUI streaming."""
+        log = logging.getLogger("smolcrawl_pipeline")
+        for i in range(1, 6):
+            msg = f"Test message {i}/5 (t={i * 3}s)\n"
+            log.info("[test_stream] yielding: %s", msg.strip())
+            yield msg
+            time.sleep(3)
+        log.info("[test_stream] done")
+        yield "**Test complete.**\n"
+
     def pipe(
         self,
         user_message: str,
@@ -56,6 +68,10 @@ class Pipeline:
 
         Streams progress as markdown-formatted status updates.
         """
+        # Diagnostic: "test stream" triggers a simple delayed-yield test
+        if user_message.strip().lower() == "test stream":
+            return self._test_stream()
+
         url = self._extract_url(user_message)
         if not url:
             return ("Please provide a URL to crawl and a knowledge base name.\n\n"
@@ -80,6 +96,9 @@ class Pipeline:
         from smolcrawl.augment import augment_pages
         from smolcrawl.owui_client import OwuiConfig, OwuiKnowledgeClient
 
+        log = logging.getLogger("smolcrawl_pipeline")
+
+        log.info("[pipeline] starting, url=%s kb=%s", url, kb_name)
         yield f"## SmolCrawl Pipeline\n\n"
         yield f"**Target:** {url}\n"
         yield f"**Knowledge Base:** {kb_name}\n"
@@ -127,7 +146,9 @@ class Pipeline:
                 # Nothing arrived — emit heartbeat if overdue
                 if time.monotonic() - last_yield >= self._HEARTBEAT_INTERVAL:
                     elapsed = int(time.monotonic() - start_time)
-                    yield f"⏳ Crawling… {last_count} pages ({elapsed}s)\n"
+                    msg = f"⏳ Crawling… {last_count} pages ({elapsed}s)\n"
+                    log.info("[pipeline] heartbeat yield: %s", msg.strip())
+                    yield msg
                     last_yield = time.monotonic()
                 continue
 
@@ -137,7 +158,9 @@ class Pipeline:
                 # Yield a batched summary at most every _PROGRESS_INTERVAL
                 if time.monotonic() - last_yield >= self._PROGRESS_INTERVAL:
                     elapsed = int(time.monotonic() - start_time)
-                    yield f"Crawled **{last_count}** pages so far ({elapsed}s)\n"
+                    msg = f"Crawled **{last_count}** pages so far ({elapsed}s)\n"
+                    log.info("[pipeline] progress yield: %s", msg.strip())
+                    yield msg
                     last_yield = time.monotonic()
             elif item[0] == "done":
                 pages = item[1]
