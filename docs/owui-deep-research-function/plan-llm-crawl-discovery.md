@@ -50,7 +50,7 @@ class EvaluatedLink:
     source_page: str      # Page where the link was found
     domain: str           # Extracted domain
 
-@dataclass  
+@dataclass
 class EvaluatorConfig:
     llm_base_url: str = "http://openwebui:8080"  # OWUI model endpoint
     llm_api_key: str = ""
@@ -188,15 +188,15 @@ To avoid calling the LLM for every single outbound link:
 
 Added to `ProcessingConfig` (doc_processor.py) and pipeline Valves:
 
-| Setting | Type | Default | Description |
-|---|---|---|---|
-| `enable_llm_discovery` | bool | `False` | Enable LLM link evaluation |
-| `crawl_goal` | str | `""` | Topic description for LLM scoring |
-| `llm_discovery_batch_size` | int | `20` | Links per LLM evaluation call |
-| `llm_discovery_min_score` | float | `0.6` | Minimum score for user presentation |
-| `llm_discovery_max_prompts` | int | `3` | Max user approval interruptions |
-| `llm_base_url` | str | `""` | LLM endpoint (defaults to OWUI) |
-| `llm_api_key` | str | `""` | LLM auth token |
+| Setting                     | Type  | Default | Description                         |
+| --------------------------- | ----- | ------- | ----------------------------------- |
+| `enable_llm_discovery`      | bool  | `False` | Enable LLM link evaluation          |
+| `crawl_goal`                | str   | `""`    | Topic description for LLM scoring   |
+| `llm_discovery_batch_size`  | int   | `20`    | Links per LLM evaluation call       |
+| `llm_discovery_min_score`   | float | `0.6`   | Minimum score for user presentation |
+| `llm_discovery_max_prompts` | int   | `3`     | Max user approval interruptions     |
+| `llm_base_url`              | str   | `""`    | LLM endpoint (defaults to OWUI)     |
+| `llm_api_key`               | str   | `""`    | LLM auth token                      |
 
 ## Implementation Steps
 

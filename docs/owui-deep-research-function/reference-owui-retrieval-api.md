@@ -12,6 +12,7 @@ Authorization: Bearer {api_key}
 ```
 
 Response:
+
 ```json
 [
   {
@@ -54,16 +55,18 @@ Content-Type: application/json
 ```
 
 Parameters:
+
 - `collection_name` — the collection ID (UUID) to search
 - `query` — natural language query string
 - `k` — number of top results to return (top-K)
 - `r` — relevance score threshold (0.0 = no filter)
 
 Response:
+
 ```json
 {
   "documents": [["chunk text 1", "chunk text 2"]],
-  "metadatas": [[{"source": "file.md", "page": 1}]],
+  "metadatas": [[{ "source": "file.md", "page": 1 }]],
   "distances": [[0.23, 0.45]]
 }
 ```
@@ -107,7 +110,7 @@ for iteration in range(max_iterations):
                     "k": top_k,
                 }
             ).json()
-            
+
             for chunk in result["documents"][0]:
                 chunk_key = (collection_id, hashlib.sha256(chunk.encode()).hexdigest()[:16])
                 if chunk_key not in seen_chunks:

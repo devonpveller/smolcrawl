@@ -4,7 +4,7 @@
 
 When a user queries a RAG-backed knowledge base, the quality of results is bounded by the user's vocabulary. If the user doesn't prompt with the exact term stored in the collection, relevant chunks are missed. An LLM can bridge this gap by propagating adjacent concepts, synonyms, and abstractions to pull a broader set of knowledge — but today there is no mechanism for this iterative expansion within Open WebUI.
 
-Additionally, the crawl process that *builds* these knowledge collections is currently user-directed. The user must supply seed URLs. An LLM can discover related domains and resources that the user wouldn't think to search for, widening the knowledge base before the iterative RAG loop even begins.
+Additionally, the crawl process that _builds_ these knowledge collections is currently user-directed. The user must supply seed URLs. An LLM can discover related domains and resources that the user wouldn't think to search for, widening the knowledge base before the iterative RAG loop even begins.
 
 ## Solution Overview
 
@@ -49,7 +49,7 @@ SmolCrawl (build-time):
 
 ### Architecture
 
-The pipeline is an OWUI **Pipeline** (intercepts messages, streams responses). It lives alongside the existing SmolCrawl Knowledge Builder pipeline but serves the opposite direction: *reading* from knowledge collections instead of *writing* to them.
+The pipeline is an OWUI **Pipeline** (intercepts messages, streams responses). It lives alongside the existing SmolCrawl Knowledge Builder pipeline but serves the opposite direction: _reading_ from knowledge collections instead of _writing_ to them.
 
 **Activation**: User prefixes query with a trigger phrase (e.g., `deep research: <query>` or `/research <query>`).
 
@@ -105,24 +105,24 @@ Step 6 — Synthesis
 
 ### Valve Configuration
 
-| Valve | Type | Default | Description |
-|---|---|---|---|
-| `trigger_prefix` | str | `"deep research:"` | Message prefix that activates the pipeline |
-| `max_iterations` | int | `3` | Hard cap on expansion iterations |
-| `fixed_iterations` | int | `2` | Guaranteed iterations before continue-decision |
-| `top_k_per_collection` | int | `5` | Chunks retrieved per collection per query |
-| `max_collections` | int | `10` | Max collections to search (LLM selects best) |
-| `owui_base_url` | str | `"http://openwebui:8080"` | OWUI API base |
-| `owui_api_key` | str | `""` | Bearer token for OWUI API |
-| `include_sources` | bool | `True` | Append source references to final answer |
+| Valve                  | Type | Default                   | Description                                    |
+| ---------------------- | ---- | ------------------------- | ---------------------------------------------- |
+| `trigger_prefix`       | str  | `"deep research:"`        | Message prefix that activates the pipeline     |
+| `max_iterations`       | int  | `3`                       | Hard cap on expansion iterations               |
+| `fixed_iterations`     | int  | `2`                       | Guaranteed iterations before continue-decision |
+| `top_k_per_collection` | int  | `5`                       | Chunks retrieved per collection per query      |
+| `max_collections`      | int  | `10`                      | Max collections to search (LLM selects best)   |
+| `owui_base_url`        | str  | `"http://openwebui:8080"` | OWUI API base                                  |
+| `owui_api_key`         | str  | `""`                      | Bearer token for OWUI API                      |
+| `include_sources`      | bool | `True`                    | Append source references to final answer       |
 
 ### OWUI API Endpoints Used
 
-| Endpoint | Method | Purpose |
-|---|---|---|
-| `/api/v1/knowledge/` | GET | List all knowledge collections |
-| `/api/v1/knowledge/{id}` | GET | Get collection metadata |
-| `/api/v1/retrieval/query` | POST | RAG query against a collection |
+| Endpoint                  | Method | Purpose                        |
+| ------------------------- | ------ | ------------------------------ |
+| `/api/v1/knowledge/`      | GET    | List all knowledge collections |
+| `/api/v1/knowledge/{id}`  | GET    | Get collection metadata        |
+| `/api/v1/retrieval/query` | POST   | RAG query against a collection |
 
 ### Sub-Agent Pattern
 
