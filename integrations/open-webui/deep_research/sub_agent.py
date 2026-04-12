@@ -118,17 +118,18 @@ class SubAgent:
     def _parse_json_response(text: str) -> Any:
         """Extract and parse JSON from an LLM response.
 
-        Handles both pure JSON and JSON wrapped in markdown code blocks.
+        Handles pure JSON, JSON in markdown code blocks, and JSON
+        embedded in surrounding commentary text.
         """
         text = text.strip()
 
-        # Try pure JSON first
+        # Attempt 1: Pure JSON
         try:
             return json.loads(text)
         except json.JSONDecodeError:
             pass
 
-        # Try extracting from markdown code blocks
+        # Attempt 2: Markdown code blocks
         import re
 
         pattern = r"```(?:json)?\s*\n?(.*?)\n?\s*```"
@@ -139,8 +140,17 @@ class SubAgent:
             except json.JSONDecodeError:
                 pass
 
+        # Attempt 3: Find first JSON array or object in raw text
+        for pat in [r'(\[\s*\{.*\}\s*\])', r'(\{.*\})']:
+            m = re.search(pat, text, re.DOTALL)
+            if m:
+                try:
+                    return json.loads(m.group(1))
+                except json.JSONDecodeError:
+                    pass
+
         raise ValueError(
-            f"Could not parse JSON from LLM response: {text[:200]}..."
+            f"Could not parse JSON from LLM response: {text[:300]}..."
         )
 
     @staticmethod

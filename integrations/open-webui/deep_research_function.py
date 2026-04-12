@@ -301,17 +301,27 @@ class _SubAgent:
 
 def _parse_json(text: str) -> Any:
     text = text.strip()
+    # Attempt 1: Direct parse
     try:
         return json.loads(text)
     except json.JSONDecodeError:
         pass
+    # Attempt 2: Markdown code fence
     match = re.search(r"```(?:json)?\s*\n?(.*?)\n?\s*```", text, re.DOTALL)
     if match:
         try:
             return json.loads(match.group(1).strip())
         except json.JSONDecodeError:
             pass
-    raise ValueError(f"Could not parse JSON from LLM response: {text[:200]}...")
+    # Attempt 3: Find first JSON array or object in the text
+    for pattern in [r'(\[\s*\{.*\}\s*\])', r'(\{.*\})']:
+        m = re.search(pattern, text, re.DOTALL)
+        if m:
+            try:
+                return json.loads(m.group(1))
+            except json.JSONDecodeError:
+                pass
+    raise ValueError(f"Could not parse JSON from LLM response: {text[:300]}...")
 
 
 # =============================================================================
@@ -679,15 +689,22 @@ class _Synthesizer:
 # =============================================================================
 
 _WEB_SEARCH_PROMPT = """\
-Search the web for authoritative information about the topic below.
+You have web search results for the user's query. Reformat ALL search \
+results into a JSON array.
 
-IMPORTANT: Cover ALL specific concepts, terms, and proper nouns mentioned \
-in the RESEARCH ANCHOR. If the anchor mentions a specific technique, \
-framework, or term, ensure at least some results address that term \
-directly \u2014 do not substitute a broader or adjacent topic.
+Rules:
+- Include EVERY result the search returned \u2014 do not filter or skip any.
+- For each result, extract: url, domain, title, summary (2-3 sentences), \
+relevance (0.0-1.0 vs the RESEARCH ANCHOR below).
+- Prefer diverse sources: include results from different organizations, \
+academic papers, independent blogs, and contrasting viewpoints \u2014 not just \
+the company or person mentioned in the query.
+
+RESEARCH ANCHOR (for relevance scoring only):
+{anchor}
 
 Return JSON array: [{{"url":"...","domain":"...","title":"...","summary":"2-3 sentences","relevance":0.0-1.0}}]
-Return at most {max_results} results. Respond ONLY with valid JSON.\
+Return at most {max_results} results. Respond ONLY with valid JSON, no commentary.\
 """
 
 _RELEVANCE_GATE_PROMPT = """\
@@ -696,15 +713,16 @@ web search results, judge each result.
 
 For EACH result, decide:
 - "relevant": directly addresses one or more key concepts / must_cover items from the anchor
-- "trail": partially related \u2014 it doesn't answer the query directly but \
-could lead to deeper, more relevant sources (e.g. overview pages, indexes, related-topic pages)
+- "trail": partially related \u2014 it may not answer the query directly but \
+could lead to deeper sources. Also use "trail" for contrasting viewpoints \
+or alternative approaches that are still within the anchor's domain.
 - "drop": completely off-topic, about a different subject, or too vague
 
 Return JSON array in the same order as the input:
 [{{"index": 0, "verdict": "relevant"|"trail"|"drop", "reason": "one sentence"}}]
 
-Be strict \u2014 'relevant' means the source specifically addresses the user's \
-concepts. Broader or adjacent topics are 'trail' at best.
+Be strict for "relevant" but generous for "trail" \u2014 contrasting or \
+competing perspectives within the domain are valuable trail sources.
 Respond ONLY with valid JSON.\
 """
 
@@ -729,13 +747,16 @@ Stay anchored \u2014 only suggest terms that serve the user's original query.\
 
 _PIVOT_PROMPT = """\
 The previous web search returned NO results relevant to the RESEARCH ANCHOR.
-Generate completely different search terms to approach the topic from a \
-new angle. Think about:
-- Different terminology for the same concepts
-- The problem the user is trying to solve (search for that instead)
-- Specific authors, tools, or projects related to the anchor's must_cover items
+Generate 3-5 completely different search terms to approach the topic from \
+new angles. Strategies:
+- Use different terminology or synonyms for the same concepts
+- Search for the PROBLEM the user is trying to solve, not the solution
+- Try specific authors, tools, frameworks, or competing projects
+- Search for academic/research terms instead of marketing terms
+- Try contrasting viewpoints: "limitations of X" or "alternatives to X"
+- Do NOT just rephrase the same query \u2014 genuinely pivot
 
-Return JSON: {{"terms": ["new_term1", "new_term2", "new_term3"], "strategy": "one sentence explaining the pivot"}}\
+Return JSON: {{"terms": ["term1", "term2", "term3"], "strategy": "one sentence"}}\
 """
 
 _ANALYSIS_PROMPT = """\
@@ -873,11 +894,14 @@ class _QuickResearcher:
     # --- Search helpers ---
 
     async def _web_search(self, session, query, request, user):
+        # CRITICAL: anchor goes in system prompt (guides LLM formatting),
+        # search query goes in user prompt ALONE (guides OWUI's web search).
+        system = _WEB_SEARCH_PROMPT.format(
+            max_results=self._v.max_web_results, anchor=session.anchor)
         try:
-            return await self._sa.run_json(
-                _WEB_SEARCH_PROMPT.format(max_results=self._v.max_web_results),
-                f"{session.anchor}\n\nSearch for: {query}", request, user, enable_web_search=True)
-        except Exception:
+            return await self._sa.run_json(system, query, request, user, enable_web_search=True)
+        except Exception as e:
+            logger.warning("Web search parse failed for query '%s': %s", query[:80], e)
             return []
 
     # --- Relevance gate: returns (relevant, trail, drop_count) ---
