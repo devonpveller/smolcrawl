@@ -51,10 +51,10 @@ class Valves(BaseModel):
 
     # Research settings (shared by research + deep_research)
     max_iterations: int = Field(
-        default=3,
+        default=5,
         ge=1,
-        le=10,
-        description="Hard cap on RAG expansion iterations",
+        le=15,
+        description="Hard cap on research iterations",
     )
     fixed_iterations: int = Field(
         default=2,
@@ -62,11 +62,17 @@ class Valves(BaseModel):
         le=5,
         description="Guaranteed iterations before continue-decision",
     )
+    min_relevant_sources: int = Field(
+        default=5,
+        ge=1,
+        le=30,
+        description="Target: stop researching once this many anchor-relevant sources are found",
+    )
     max_web_results: int = Field(
         default=10,
         ge=1,
         le=50,
-        description="Max web search results to store per query",
+        description="Max web search results per query",
     )
     include_sources: bool = Field(
         default=True,

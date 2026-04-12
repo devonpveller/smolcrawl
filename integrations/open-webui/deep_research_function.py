@@ -643,12 +643,13 @@ class _Synthesizer:
             if c:
                 iter_mds.append(c)
 
-        parts = [f"# Original Query\n\n{session.query}\n"]
+        parts = [f"# Research Anchor\n\n{session.anchor}\n"]
+        parts.append(f"# Original Query\n\n{session.query}\n")
         if prompt_md:
             parts.append(f"# Context\n\n{prompt_md}\n")
         for i, md in enumerate(iter_mds, 1):
             parts.append(f"# Iteration {i}\n\n{md}\n")
-        parts.append("\n---\nProduce a comprehensive, well-cited synthesis.")
+        parts.append("\n---\nProduce a comprehensive synthesis that addresses EVERY item in the Research Anchor's 'must_cover' list.")
 
         try:
             answer = await self._sa.run(_SYNTHESIS_PROMPT, "\n\n".join(parts), request, user)
@@ -681,40 +682,87 @@ _WEB_SEARCH_PROMPT = """\
 Search the web for authoritative information about the topic below.
 
 IMPORTANT: Cover ALL specific concepts, terms, and proper nouns mentioned \
-in the query. If the query mentions a specific technique, framework, or \
-term, ensure at least some results address that term directly — do not \
-substitute a broader or adjacent topic.
+in the RESEARCH ANCHOR. If the anchor mentions a specific technique, \
+framework, or term, ensure at least some results address that term \
+directly \u2014 do not substitute a broader or adjacent topic.
 
 Return JSON array: [{{"url":"...","domain":"...","title":"...","summary":"2-3 sentences","relevance":0.0-1.0}}]
 Return at most {max_results} results. Respond ONLY with valid JSON.\
 """
 
+_RELEVANCE_GATE_PROMPT = """\
+You are a strict relevance judge. Given a RESEARCH ANCHOR and a list of \
+web search results, judge each result.
+
+For EACH result, decide:
+- "relevant": directly addresses one or more key concepts / must_cover items from the anchor
+- "trail": partially related \u2014 it doesn't answer the query directly but \
+could lead to deeper, more relevant sources (e.g. overview pages, indexes, related-topic pages)
+- "drop": completely off-topic, about a different subject, or too vague
+
+Return JSON array in the same order as the input:
+[{{"index": 0, "verdict": "relevant"|"trail"|"drop", "reason": "one sentence"}}]
+
+Be strict \u2014 'relevant' means the source specifically addresses the user's \
+concepts. Broader or adjacent topics are 'trail' at best.
+Respond ONLY with valid JSON.\
+"""
+
+_EXTRACT_TOPICS_PROMPT = """\
+You are a research strategist. Given a RESEARCH ANCHOR and a set of \
+relevant sources that were just confirmed to match the user's query, \
+extract:
+
+1. **Deeper topics**: specific sub-topics, techniques, or terms mentioned \
+IN the relevant sources that would yield even more targeted results if \
+searched directly.
+2. **Adjacent leads**: related topics from 'trail' sources that could \
+connect to relevant material if pursued one level deeper.
+
+Return JSON:
+{{"deeper_terms": ["specific term from source content to search next"],
+  "adjacent_leads": ["terms from trail sources worth pursuing"],
+  "covered_so_far": ["anchor concepts now fully covered"]}}
+
+Stay anchored \u2014 only suggest terms that serve the user's original query.\
+"""
+
+_PIVOT_PROMPT = """\
+The previous web search returned NO results relevant to the RESEARCH ANCHOR.
+Generate completely different search terms to approach the topic from a \
+new angle. Think about:
+- Different terminology for the same concepts
+- The problem the user is trying to solve (search for that instead)
+- Specific authors, tools, or projects related to the anchor's must_cover items
+
+Return JSON: {{"terms": ["new_term1", "new_term2", "new_term3"], "strategy": "one sentence explaining the pivot"}}\
+"""
+
 _ANALYSIS_PROMPT = """\
-Analyze collected web sources against the ORIGINAL research query.
+Analyze collected web sources against the RESEARCH ANCHOR.
 
 1. Summarize what the sources cover well.
-2. Identify which specific aspects of the ORIGINAL query are NOT yet \
-addressed (gaps). Be precise — quote the user’s words.
+2. Identify which specific aspects of the anchor are NOT yet \
+addressed (gaps). Be precise \u2014 quote the anchor's must_cover items.
 3. Suggest search terms that would specifically fill those gaps.
 
 Return JSON:
-{{"summary":"2-3 paragraphs","gaps":["specific unaddressed aspects of the original query"],"covered_aspects":["aspects well-covered"],"new_terms":["terms targeting the gaps, anchored to original query"],"new_concepts":["concepts discovered"]}}\
-"""
-
-_EXPAND_PROMPT = """\
-Given findings so far and the ORIGINAL query, identify what aspects of \
-the query are still NOT adequately covered.
-
-Prioritize search terms that fill gaps in coverage of the original query.
-Do NOT drift toward tangential topics — stay focused on what the user \
-specifically asked about. Include the user’s own terminology.
-
-Return JSON:
-{{"terms":["term1","term2"],"rationale":"why these fill gaps","uncovered_aspects":["aspects still needing coverage"]}}\
+{{"summary":"2-3 paragraphs","gaps":["specific unaddressed aspects"],"covered_aspects":["aspects well-covered"],"new_terms":["terms targeting the gaps"],"new_concepts":["concepts discovered"]}}\
 """
 
 
 class _QuickResearcher:
+    """Goal-driven research: iterate until min_relevant_sources are found.
+
+    Flow per iteration:
+    1. Web search with current terms
+    2. Relevance gate: classify each result as relevant / trail / drop
+    3. If relevant hits found -> extract deeper topics from them
+       If no relevant hits -> pivot to completely different search terms
+    4. Repeat until enough relevant sources accumulated or max_iterations hit
+    5. Synthesize using ALL sources (relevant + trail chain)
+    """
+
     def __init__(self, valves, sa: _SubAgent, j: _Journal, synth: _Synthesizer):
         self._v = valves
         self._sa = sa
@@ -726,93 +774,185 @@ class _QuickResearcher:
         sdir = self._j.resolve_session_dir(user_id, slug, namespace="research")
         session = ResearchSession(session_id=f"research-{slug}", query=query, session_dir=sdir, model_id=model_id)
         self._j.write_prompt(session, model_id)
-        await _emit(emitter, "📋 Research session started")
+        await _emit(emitter, "\U0001f4cb Research session started")
 
-        # Extract anchor once — threads through all subsequent prompts
+        # Extract anchor once -- threads through every subsequent prompt
         session.anchor = await _extract_anchor(self._sa, query, request, user)
         self._j.write_anchor(session)
-        await _emit(emitter, "🎯 Research anchor extracted")
+        await _emit(emitter, "\U0001f3af Research anchor extracted")
 
-        total_sources = 0
         session.phase = ResearchPhase.RESEARCHING
-        sources = await self._web_search(query, request, user)
-        await self._store_sources(session, sources)
-        total_sources += len(sources)
-        await _emit(emitter, f"🌐 {total_sources} source(s) found")
+        relevant_sources: List[Dict] = []       # confirmed anchor-matching
+        trail_sources: List[Dict] = []           # led us toward relevant hits
+        seen_urls: set = set()
+        search_terms = [query]
+        tried_terms: set = set()
+        target = self._v.min_relevant_sources
+        consecutive_misses = 0
 
-        analysis = await self._analyze(session, request, user)
-        gaps = analysis.get("gaps", [])
-        terms = [query] + analysis.get("new_terms", [])
-        it = IterationResult(1, [query], ["web_search"], len(sources), len(sources),
-                             analysis.get("summary", ""), analysis.get("new_concepts", []))
-        session.iterations.append(it)
-        self._j.write_iteration(session, it)
-
-        if gaps:
-            await _emit(emitter, f"🔍 Gaps: {', '.join(gaps[:3])}")
-
-        seen = {s.get("url", "") for s in sources}
-        for n in range(2, self._v.max_iterations + 1):
-            expanded = await self._expand(session, terms, request, user)
-            new_t = [t for t in expanded if t not in terms]
-            if not new_t:
+        for n in range(1, self._v.max_iterations + 1):
+            # --- Step 1: Web search ---
+            new_terms = [t for t in search_terms if t not in tried_terms]
+            if not new_terms and n > 1:
+                await _emit(emitter, "\u2705 No new terms to explore")
                 break
-            new_src = await self._search_terms(new_t, seen, request, user)
-            if new_src:
-                await self._store_sources(session, new_src)
-                seen.update(s.get("url", "") for s in new_src)
-                total_sources += len(new_src)
-            analysis2 = await self._analyze(session, request, user)
-            gaps = analysis2.get("gaps", [])
-            it2 = IterationResult(n, new_t, ["web_search"], len(new_src), len(new_src),
-                                  analysis2.get("summary", ""), analysis2.get("new_concepts", []))
-            session.iterations.append(it2)
-            self._j.write_iteration(session, it2)
-            terms += new_t
-            gap_hint = f" | Gaps: {', '.join(gaps[:2])}" if gaps else ""
-            await _emit(emitter, f"🔄 Iter {n}: +{len(new_src)} source(s), {total_sources} total{gap_hint}")
-            if n >= self._v.fixed_iterations:
-                try:
-                    r = await self._sa.run_json(_CONTINUE_PROMPT, f"{session.anchor}\nIters:\n" +
-                        "\n".join(f"Iter {i.iteration_number}: {i.new_chunks} sources, summary: {i.summary[:100]}" for i in session.iterations), request, user)
-                    if not r.get("continue", False):
-                        break
-                except Exception:
-                    break
+            tried_terms.update(new_terms)
 
+            raw = await self._web_search(session, " OR ".join(f'"{t}"' for t in new_terms) if len(new_terms) > 1 else new_terms[0], request, user)
+            raw = [r for r in raw if r.get("url", "") not in seen_urls]
+            seen_urls.update(r.get("url", "") for r in raw)
+
+            if not raw:
+                consecutive_misses += 1
+                it = IterationResult(n, new_terms, ["web_search"], 0, 0, "No results returned.", [])
+                session.iterations.append(it)
+                self._j.write_iteration(session, it)
+                await _emit(emitter, f"\U0001f504 Iter {n}: 0 results \u2014 pivoting")
+                search_terms = await self._pivot(session, tried_terms, request, user)
+                continue
+
+            # --- Step 2: Relevance gate ---
+            rel, trail, dropped = await self._relevance_gate(session, raw, request, user)
+
+            relevant_sources.extend(rel)
+            trail_sources.extend(trail)
+            all_kept = rel + trail
+            await self._store_sources(session, all_kept, n)
+
+            rel_count = len(relevant_sources)
+            summary = ""
+
+            # --- Step 3: Branch based on whether we got relevant hits ---
+            if rel:
+                consecutive_misses = 0
+                # Extract deeper topics from the relevant sources
+                extraction = await self._extract_topics(session, rel, trail, request, user)
+                deeper = extraction.get("deeper_terms", [])
+                adjacent = extraction.get("adjacent_leads", [])
+                covered = extraction.get("covered_so_far", [])
+                summary = (f"Found {len(rel)} relevant, {len(trail)} trail, dropped {dropped}. "
+                           f"Covered: {', '.join(covered[:3])}. Deeper: {', '.join(deeper[:3])}.")
+                search_terms = deeper + adjacent  # dive deeper
+                await _emit(emitter, f"\U0001f3af Iter {n}: +{len(rel)} relevant ({rel_count} total), +{len(trail)} trail \u2014 diving deeper")
+            else:
+                consecutive_misses += 1
+                summary = f"No relevant hits (kept {len(trail)} trail, dropped {dropped}). Pivoting."
+                search_terms = await self._pivot(session, tried_terms, request, user)
+                await _emit(emitter, f"\U0001f504 Iter {n}: 0 relevant, {len(trail)} trail \u2014 pivoting ({consecutive_misses})")
+
+            it = IterationResult(n, new_terms, ["web_search"], len(raw), len(all_kept), summary, [])
+            session.iterations.append(it)
+            self._j.write_iteration(session, it)
+
+            # --- Step 4: Check goal ---
+            if rel_count >= target:
+                await _emit(emitter, f"\u2705 Target reached: {rel_count}/{target} relevant sources")
+                break
+
+            if consecutive_misses >= 3:
+                await _emit(emitter, f"\u26a0\ufe0f 3 consecutive misses \u2014 proceeding with {rel_count} relevant")
+                break
+
+        # --- Final analysis of everything we collected ---
+        analysis = await self._analyze(session, request, user)
+        if analysis.get("gaps"):
+            await _emit(emitter, f"\U0001f50d Remaining gaps: {', '.join(analysis['gaps'][:3])}")
+
+        # --- Synthesize ---
         session.phase = ResearchPhase.SYNTHESIZING
-        await _emit(emitter, "🧠 Synthesizing...")
+        await _emit(emitter, f"\U0001f9e0 Synthesizing ({len(relevant_sources)} relevant + {len(trail_sources)} trail sources)...")
         answer = await self._synth.synthesize(session, request, user)
         session.phase = ResearchPhase.COMPLETE
-        await _emit(emitter, f"📁 Journal: research/{slug}/", done=True)
+        await _emit(emitter, f"\U0001f4c1 Journal: research/{slug}/", done=True)
 
-        if len(session.iterations) >= 2 and sum(i.chunks_found for i in session.iterations) >= 5:
-            answer += ("\n\n---\n\n💡 *For deeper analysis, consider `deep_research()` to crawl "
-                       "authoritative sources into permanent knowledge collections.*")
+        if len(relevant_sources) < target:
+            answer += (f"\n\n---\n\n\u26a0\ufe0f *Only {len(relevant_sources)}/{target} relevant sources found. "
+                       f"Consider `deep_research()` to crawl authoritative domains.*")
         return answer
 
-    async def _web_search(self, query, request, user):
+    # --- Search helpers ---
+
+    async def _web_search(self, session, query, request, user):
         try:
             return await self._sa.run_json(
                 _WEB_SEARCH_PROMPT.format(max_results=self._v.max_web_results),
-                f"Search for: {query}", request, user, enable_web_search=True)
+                f"{session.anchor}\n\nSearch for: {query}", request, user, enable_web_search=True)
         except Exception:
             return []
 
-    async def _search_terms(self, terms, seen, request, user):
-        q = " OR ".join(f'"{t}"' for t in terms)
-        results = await self._web_search(q, request, user)
-        return [r for r in results if r.get("url", "") not in seen]
+    # --- Relevance gate: returns (relevant, trail, drop_count) ---
 
-    async def _store_sources(self, session, sources):
+    async def _relevance_gate(self, session, sources, request, user):
+        if not sources:
+            return [], [], 0
+        summaries = "\n".join(
+            f"{i}. [{s.get('domain','')}] {s.get('title','?')}: {s.get('summary','')[:150]}"
+            for i, s in enumerate(sources))
+        try:
+            verdicts = await self._sa.run_json(_RELEVANCE_GATE_PROMPT,
+                f"{session.anchor}\n\nResults to judge:\n{summaries}", request, user)
+            if not isinstance(verdicts, list):
+                return sources, [], 0  # can't parse -- keep all as relevant
+            relevant, trail = [], []
+            for v in verdicts:
+                if not isinstance(v, dict):
+                    continue
+                idx = v.get("index", -1)
+                if 0 <= idx < len(sources):
+                    verdict = v.get("verdict", "drop")
+                    if verdict == "relevant":
+                        relevant.append(sources[idx])
+                    elif verdict == "trail":
+                        trail.append(sources[idx])
+            dropped = len(sources) - len(relevant) - len(trail)
+            logger.info("Relevance gate: %d relevant, %d trail, %d dropped", len(relevant), len(trail), dropped)
+            return relevant, trail, dropped
+        except Exception:
+            return sources, [], 0
+
+    # --- Extract deeper topics from relevant hits ---
+
+    async def _extract_topics(self, session, relevant, trail, request, user):
+        rel_text = "\n\n".join(
+            f"**[{s.get('domain','')}] {s.get('title','?')}**\n{s.get('summary','')}"
+            for s in relevant[:10])
+        trail_text = "\n\n".join(
+            f"**[{s.get('domain','')}] {s.get('title','?')}**\n{s.get('summary','')}"
+            for s in trail[:5])
+        try:
+            return await self._sa.run_json(_EXTRACT_TOPICS_PROMPT,
+                f"{session.anchor}\n\n## Relevant Sources\n{rel_text}\n\n## Trail Sources\n{trail_text}",
+                request, user)
+        except Exception:
+            return {"deeper_terms": [], "adjacent_leads": [], "covered_so_far": []}
+
+    # --- Pivot: generate completely new terms when nothing relevant found ---
+
+    async def _pivot(self, session, tried_terms, request, user):
+        tried_str = ", ".join(sorted(tried_terms)[:20])
+        iters = "\n".join(f"- Iter {i.iteration_number}: {i.summary[:150]}" for i in session.iterations)
+        try:
+            r = await self._sa.run_json(_PIVOT_PROMPT,
+                f"{session.anchor}\n\nAlready tried: {tried_str}\nResults so far:\n{iters}",
+                request, user)
+            return r.get("terms", [])
+        except Exception:
+            return []
+
+    # --- Storage ---
+
+    async def _store_sources(self, session, sources, iteration=0):
         sdir = os.path.join(session.session_dir, "sources")
         os.makedirs(sdir, exist_ok=True)
+        prefix = f"iter{iteration}-" if iteration else ""
         for i, s in enumerate(sources, 1):
             domain = s.get("domain", "unknown")
-            with open(os.path.join(sdir, f"{domain}-{i}.md"), "w", encoding="utf-8") as f:
+            with open(os.path.join(sdir, f"{prefix}{domain}-{i}.md"), "w", encoding="utf-8") as f:
                 f.write(f"# {s.get('title', domain)}\n\n[Source: {s.get('url', '')}]\n[Relevance: {s.get('relevance', 0.0)}]\n\n## Content\n\n{s.get('summary', '')}\n")
-        idx = ["# Sources\n"] + [f"{i}. **{s.get('title', '?')}** ({s.get('domain', '')}) — {s.get('relevance', 0):.2f}\n" for i, s in enumerate(sources, 1)]
-        self._j.write_entry(session.session_dir, "01-sources.md", "\n".join(idx))
+        idx = ["# Sources\n"] + [f"{i}. **{s.get('title', '?')}** ({s.get('domain', '')}) \u2014 {s.get('relevance', 0):.2f}\n" for i, s in enumerate(sources, 1)]
+        self._j.write_entry(session.session_dir, f"sources-iter{iteration}.md", "\n".join(idx))
+
+    # --- Final analysis ---
 
     async def _analyze(self, session, request, user):
         sdir = os.path.join(session.session_dir, "sources")
@@ -831,17 +971,7 @@ class _QuickResearcher:
         except Exception:
             return {"summary": f"Found {len(texts)} sources.", "gaps": [], "new_terms": [], "covered_aspects": []}
 
-    async def _expand(self, session, terms, request, user):
-        sums = "\n".join(f"- Iter {i.iteration_number}: {i.summary[:200]}" for i in session.iterations)
-        try:
-            r = await self._sa.run_json(_EXPAND_PROMPT,
-                f"{session.anchor}\nCurrent search terms: {', '.join(terms)}\nFindings so far:\n{sums}", request, user)
-            return r.get("terms", [])
-        except Exception:
-            return []
 
-
-# =============================================================================
 #  Status emitter helper
 # =============================================================================
 
@@ -869,8 +999,9 @@ class Tools:
         smolcrawl_api_key: str = Field(default="0p3n-w3bu!", description="Pipelines server API key")
         owui_base_url: str = Field(default="http://openwebui:8080", description="Open WebUI API base URL")
         owui_api_key: str = Field(default="", description="Bearer token for OWUI API")
-        max_iterations: int = Field(default=3, ge=1, le=10, description="Hard cap on research iterations")
+        max_iterations: int = Field(default=5, ge=1, le=15, description="Hard cap on research iterations")
         fixed_iterations: int = Field(default=2, ge=1, le=5, description="Guaranteed iterations before continue-decision")
+        min_relevant_sources: int = Field(default=5, ge=1, le=30, description="Target: stop researching once this many anchor-relevant sources are found")
         max_web_results: int = Field(default=10, ge=1, le=50, description="Max web search results per query")
         include_sources: bool = Field(default=True, description="Append source references to answer")
         top_k_per_collection: int = Field(default=5, ge=1, le=20, description="Chunks per collection per query")

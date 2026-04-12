@@ -91,7 +91,7 @@ class Synthesizer:
 
         # Compose the synthesis prompt
         user_prompt = self._build_synthesis_prompt(
-            original_query=session.query,
+            session=session,
             prompt_content=prompt_content,
             iteration_summaries=iteration_summaries,
         )
@@ -119,21 +119,24 @@ class Synthesizer:
 
     @staticmethod
     def _build_synthesis_prompt(
-        original_query: str,
+        session: 'ResearchSession',
         prompt_content: str,
         iteration_summaries: List[str],
     ) -> str:
         """Construct the user prompt for synthesis.
 
         Args:
-            original_query: The original research question.
+            session: The research session (for query and anchor).
             prompt_content: Content of 00-prompt.md.
             iteration_summaries: Content of each iteration file.
 
         Returns:
             Formatted prompt string.
         """
-        parts = [f"# Original Research Query\n\n{original_query}\n"]
+        parts = []
+        if session.anchor:
+            parts.append(f"# Research Anchor\n\n{session.anchor}\n")
+        parts.append(f"# Original Research Query\n\n{session.query}\n")
 
         if prompt_content:
             parts.append(f"# Session Context\n\n{prompt_content}\n")
@@ -144,7 +147,8 @@ class Synthesizer:
         parts.append(
             "\n---\n\n"
             "Based on all the evidence above, produce a comprehensive, "
-            "well-cited synthesis answering the original query."
+            "well-cited synthesis that addresses EVERY item in the Research "
+            "Anchor's 'must_cover' list."
         )
 
         return "\n\n".join(parts)
