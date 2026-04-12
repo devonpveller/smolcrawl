@@ -92,6 +92,10 @@ class Valves(BaseModel):
         le=20,
         description="Max domains to discover via web search",
     )
+    auto_approve_domains: bool = Field(
+        default=True,
+        description="Auto-approve all non-covered domains (skip manual approval)",
+    )
 
     # Fileshed integration
     fileshed_compatible: bool = Field(

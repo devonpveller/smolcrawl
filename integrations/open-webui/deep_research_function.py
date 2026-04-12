@@ -14,7 +14,7 @@ requirements: httpx, pydantic
 #  Self-contained single-file deployment. Source modules live in
 #  integrations/open-webui/deep_research/ for development.
 #
-#  Install: OWUI Admin Panel → Functions → (+) → Paste this file
+#  Install: OWUI Workspace → Tools → (+) → Paste this file
 # =============================================================================
 
 import hashlib
@@ -767,12 +767,11 @@ async def _emit(emitter, msg: str, done: bool = False):
 
 
 class Tools:
-    """Deep Research Function for Open WebUI.
+    """Deep Research Tools for Open WebUI.
 
-    Three tool methods:
+    Two tool methods:
     - research(query): Quick web-search-based exploration
-    - deep_research(query): Full knowledge building with domain discovery
-    - deep_research_approve(selection): Approve domains and trigger crawl
+    - deep_research(query): Full pipeline — discover, crawl, RAG, synthesize
     """
 
     class Valves(BaseModel):
@@ -787,13 +786,13 @@ class Tools:
         top_k_per_collection: int = Field(default=5, ge=1, le=20, description="Chunks per collection per query")
         max_collections: int = Field(default=10, ge=1, le=50, description="Max collections to search")
         max_domains: int = Field(default=5, ge=1, le=20, description="Max domains to discover")
+        auto_approve_domains: bool = Field(default=True, description="Auto-approve all non-covered domains (skip manual approval)")
         fileshed_compatible: bool = Field(default=True, description="Write journal to Fileshed Storage zone")
         storage_base_path: str = Field(default="/app/backend/data/user_files", description="Fileshed storage base path")
         save_journal: bool = Field(default=True, description="Persist research journal to disk")
 
     def __init__(self):
         self.valves = self.Valves()
-        self._pending_sessions: Dict[str, ResearchSession] = {}
 
     async def research(
         self, query: str,
@@ -821,9 +820,11 @@ class Tools:
         __request__=None, __model__: dict = None, __event_call__=None,
         __chat_id__: str = "", __message_id__: str = "",
     ) -> str:
-        """Start deep research on a topic. Discovers relevant domains via
-        web search, checks existing knowledge collections, then presents
-        domains for your approval before crawling.
+        """Deep research on a topic. Discovers relevant domains via web
+        search, crawls them into knowledge collections, runs iterative
+        RAG retrieval, and synthesizes a comprehensive answer.
+
+        The full pipeline runs automatically: discover → crawl → research → synthesize.
 
         Args:
             query: The research question or topic to investigate.
@@ -833,13 +834,16 @@ class Tools:
         j = _Journal(self.valves)
         disc = _Discovery(self.valves, sa)
         rag = _RagResearcher(self.valves, sa)
+        crawl = _CrawlClient(self.valves)
+        synth = _Synthesizer(self.valves, sa, j)
 
         slug = _Journal.slugify(query)
         sdir = j.resolve_session_dir((__user__ or {}).get("id", ""), slug)
         session = ResearchSession(session_id=str(_uuid.uuid4()), query=query, session_dir=sdir, model_id=mid)
         j.write_prompt(session, mid)
-        await _emit(__event_emitter__, "📋 Research session started")
+        await _emit(__event_emitter__, "📋 Deep research started")
 
+        # --- Phase 1: Discover domains and check existing collections ---
         session.phase = ResearchPhase.DISCOVERING
         all_cols = await rag.list_collections()
         rel_ids = await disc.rank_collections(query, all_cols, __request__, __user__ or {})
@@ -851,41 +855,13 @@ class Tools:
         domains = disc.check_coverage(domains, all_cols)
         session.discovered_domains = domains
         j.write_domains(session, rel_cols)
-        session.phase = ResearchPhase.AWAITING_APPROVAL
-        self._pending_sessions[__chat_id__] = session
 
-        await _emit(__event_emitter__, "🌐 Domains discovered — awaiting approval")
-        return _Discovery.format_approval(domains, rel_cols)
-
-    async def deep_research_approve(
-        self, selection: str, additional_domains: str = "",
-        __user__: dict = None, __metadata__: dict = None, __event_emitter__=None,
-        __request__=None, __model__: dict = None, __event_call__=None,
-        __chat_id__: str = "", __message_id__: str = "",
-    ) -> str:
-        """Approve discovered domains and begin deep research. Call after
-        deep_research() presents domain options.
-
-        Args:
-            selection: Numbers like "1,2,3", "all", or "skip".
-            additional_domains: Optional extra domains, space-separated.
-        """
-        session = self._pending_sessions.pop(__chat_id__, None)
-        if not session:
-            return "No pending session. Start with `deep_research()` first."
-
-        mid = _SubAgent.resolve_model_id(__metadata__, __model__)
-        sa = _SubAgent(mid)
-        j = _Journal(self.valves)
-        crawl = _CrawlClient(self.valves)
-        rag = _RagResearcher(self.valves, sa)
-        synth = _Synthesizer(self.valves, sa, j)
-
-        approved = _Discovery.parse_approval(selection, session.discovered_domains, additional_domains)
-
+        # --- Phase 2: Auto-approve and crawl new domains ---
+        approved = [d for d in domains if not d.already_covered]
         if approved:
             session.phase = ResearchPhase.CRAWLING
-            await _emit(__event_emitter__, f"🕷️ Crawling {len(approved)} domain(s)...")
+            names = ", ".join(d.domain for d in approved[:5])
+            await _emit(__event_emitter__, f"🕷️ Crawling {len(approved)} domain(s): {names}")
             for d in approved:
                 kb = f"SmolCrawl - {d.domain}"
                 r = await crawl.trigger_crawl(d.domain, kb, __event_emitter__)
@@ -894,8 +870,11 @@ class Tools:
                     session.relevant_collection_ids.append(r.kb_id)
             j.write_crawl_status(session)
             ok = sum(1 for r in session.crawl_results if r.success)
-            await _emit(__event_emitter__, f"✅ Built {ok} collection(s)")
+            await _emit(__event_emitter__, f"✅ Crawled {ok}/{len(approved)} domain(s)")
+        else:
+            await _emit(__event_emitter__, "📚 All domains already in knowledge base")
 
+        # Refresh collections after crawl to pick up new KB IDs
         all_cols = await rag.list_collections()
         col_map = {c["id"]: c["name"] for c in all_cols}
         for cr in session.crawl_results:
@@ -907,10 +886,11 @@ class Tools:
                         cr.kb_id = c["id"]
                         break
 
+        # --- Phase 3: Iterative RAG research ---
         session.phase = ResearchPhase.RESEARCHING
         terms = [session.query]
         for n in range(1, self.valves.max_iterations + 1):
-            await _emit(__event_emitter__, f"📚 Iteration {n}...")
+            await _emit(__event_emitter__, f"🔍 Research iteration {n}...")
             it = await rag.run_iteration(session, terms, session.relevant_collection_ids, col_map, n, __request__, __user__ or {})
             j.write_iteration(session, it)
             await _emit(__event_emitter__, f"📚 Iter {n}: {it.new_chunks} new chunk(s)")
@@ -919,12 +899,13 @@ class Tools:
                 if n >= self.valves.max_iterations:
                     break
                 if not await rag.should_continue(session, __request__, __user__ or {}):
-                    await _emit(__event_emitter__, "✅ Search complete")
+                    await _emit(__event_emitter__, "✅ Research complete")
                     break
 
+        # --- Phase 4: Synthesize ---
         session.phase = ResearchPhase.SYNTHESIZING
-        await _emit(__event_emitter__, "🧠 Synthesizing...")
+        await _emit(__event_emitter__, "🧠 Synthesizing findings...")
         answer = await synth.synthesize(session, __request__, __user__ or {})
         session.phase = ResearchPhase.COMPLETE
-        await _emit(__event_emitter__, f"📁 Journal: deep-research/{_Journal.slugify(session.query)}/", done=True)
+        await _emit(__event_emitter__, f"📁 Journal: deep-research/{slug}/", done=True)
         return answer
