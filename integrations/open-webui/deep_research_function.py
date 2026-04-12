@@ -266,18 +266,31 @@ class _SubAgent:
         self._model_id = model_id
 
     async def run(self, system_prompt: str, user_prompt: str, request, user: Dict,
-                  enable_web_search: bool = False) -> str:
+                  enable_web_search: bool = False,
+                  json_mode: bool = False) -> str:
         from open_webui.utils.chat import generate_chat_completion
         from open_webui.models.users import UserModel
 
         # OWUI injects its own system prompt into generate_chat_completion.
-        # To ensure our instructions aren't diluted, we merge them into
-        # the user message. For web-search calls the search query must
-        # appear first so OWUI's search-extraction picks it up.
+        # We still send a short system message to set the "role" — OWUI's
+        # system prompt is prepended but ours is appended, so the model
+        # still sees it.  For JSON calls we make the role unmistakable.
+        if json_mode:
+            sys_msg = ("You are a JSON data extraction API. "
+                       "Respond with ONLY valid JSON. "
+                       "No explanations, no markdown fences, no commentary.")
+        else:
+            sys_msg = "Follow the user's instructions precisely."
+
+        # For web-search calls the search query must appear first so
+        # OWUI's search-extraction picks it up.  We bracket the query
+        # with strong JSON-mode framing so the LLM can't miss it.
         if enable_web_search:
             combined = (
+                f"[JSON-ONLY MODE — respond with a JSON array, nothing else]\n\n"
                 f"{user_prompt}\n\n"
-                f"---\nINSTRUCTIONS (follow these exactly):\n{system_prompt}"
+                f"---\nINSTRUCTIONS (follow these exactly):\n{system_prompt}\n\n"
+                f"REMINDER: Output ONLY a valid JSON array. No text before or after."
             )
         else:
             combined = (
@@ -288,6 +301,7 @@ class _SubAgent:
         form_data = {
             "model": self._model_id,
             "messages": [
+                {"role": "system", "content": sys_msg},
                 {"role": "user", "content": combined},
             ],
             "stream": False,
@@ -304,8 +318,14 @@ class _SubAgent:
 
     async def run_json(self, system_prompt: str, user_prompt: str, request, user: Dict,
                        enable_web_search: bool = False) -> Any:
-        raw = await self.run(system_prompt, user_prompt, request, user, enable_web_search)
-        return _parse_json(raw)
+        raw = await self.run(system_prompt, user_prompt, request, user,
+                             enable_web_search, json_mode=True)
+        try:
+            return _parse_json(raw)
+        except ValueError:
+            logger.warning("JSON parse failed. Raw response (first 500 chars): %s",
+                           raw[:500] if raw else "<empty>")
+            raise
 
     @staticmethod
     def resolve_model_id(metadata: Optional[Dict], model: Optional[Dict]) -> str:
@@ -644,10 +664,14 @@ _SYNTHESIS_PROMPT = """\
 You are a research synthesizer. Given a research query, iteration summaries, \
 and relevant content, produce a comprehensive answer.
 
+CRITICAL: Only cite URLs and sources that appear in the provided iteration data. \
+NEVER invent, guess, or hallucinate URLs. If a claim lacks a source in the data, \
+state it without a citation or note that the source was not found.
+
 Structure:
 ## Reasoning  (step-by-step chain of thought)
 ## Answer     (comprehensive answer)
-## Sources    (key sources cited)
+## Sources    (ONLY URLs from the provided data — never fabricated)
 ## Gaps       (remaining unknowns)\
 """
 
@@ -673,7 +697,8 @@ class _Synthesizer:
             parts.append(f"# Context\n\n{prompt_md}\n")
         for i, md in enumerate(iter_mds, 1):
             parts.append(f"# Iteration {i}\n\n{md}\n")
-        parts.append("\n---\nProduce a comprehensive synthesis that addresses EVERY item in the Research Anchor's 'must_cover' list.")
+        parts.append("\n---\nProduce a comprehensive synthesis that addresses EVERY item in the Research Anchor's 'must_cover' list.\n"
+                     "IMPORTANT: In the Sources section, list ONLY URLs that appear verbatim in the iteration data above. Do NOT fabricate or guess any URLs.")
 
         try:
             answer = await self._sa.run(_SYNTHESIS_PROMPT, "\n\n".join(parts), request, user)

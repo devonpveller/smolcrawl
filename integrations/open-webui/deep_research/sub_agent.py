@@ -31,6 +31,7 @@ class SubAgent:
         user: Dict,
         metadata: Optional[Dict] = None,
         enable_web_search: bool = False,
+        json_mode: bool = False,
     ) -> str:
         """Execute a sub-agent LLM call.
 
@@ -41,6 +42,7 @@ class SubAgent:
             user: The OWUI __user__ dict.
             metadata: Optional metadata to forward.
             enable_web_search: Whether to enable web search for this call.
+            json_mode: Whether to enforce JSON-only output framing.
 
         Returns:
             The LLM's response content as a string.
@@ -49,13 +51,25 @@ class SubAgent:
         from open_webui.models.users import UserModel
 
         # OWUI injects its own system prompt into generate_chat_completion.
-        # To ensure our instructions aren't diluted, we merge them into
-        # the user message. For web-search calls the search query must
-        # appear first so OWUI's search-extraction picks it up.
+        # We still send a short system message to set the "role" — OWUI's
+        # system prompt is prepended but ours is appended, so the model
+        # still sees it.  For JSON calls we make the role unmistakable.
+        if json_mode:
+            sys_msg = ("You are a JSON data extraction API. "
+                       "Respond with ONLY valid JSON. "
+                       "No explanations, no markdown fences, no commentary.")
+        else:
+            sys_msg = "Follow the user's instructions precisely."
+
+        # For web-search calls the search query must appear first so
+        # OWUI's search-extraction picks it up.  We bracket the query
+        # with strong JSON-mode framing so the LLM can't miss it.
         if enable_web_search:
             combined = (
+                f"[JSON-ONLY MODE — respond with a JSON array, nothing else]\n\n"
                 f"{user_prompt}\n\n"
-                f"---\nINSTRUCTIONS (follow these exactly):\n{system_prompt}"
+                f"---\nINSTRUCTIONS (follow these exactly):\n{system_prompt}\n\n"
+                f"REMINDER: Output ONLY a valid JSON array. No text before or after."
             )
         else:
             combined = (
@@ -66,6 +80,7 @@ class SubAgent:
         form_data = {
             "model": self._model_id,
             "messages": [
+                {"role": "system", "content": sys_msg},
                 {"role": "user", "content": combined},
             ],
             "stream": False,
@@ -125,8 +140,14 @@ class SubAgent:
             user=user,
             metadata=metadata,
             enable_web_search=enable_web_search,
+            json_mode=True,
         )
-        return self._parse_json_response(raw)
+        try:
+            return self._parse_json_response(raw)
+        except ValueError:
+            logger.warning("JSON parse failed. Raw response (first 500 chars): %s",
+                           raw[:500] if raw else "<empty>")
+            raise
 
     @staticmethod
     def _parse_json_response(text: str) -> Any:

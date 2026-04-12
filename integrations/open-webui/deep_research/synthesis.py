@@ -17,6 +17,10 @@ _SYNTHESIS_SYSTEM_PROMPT = """\
 You are a research synthesizer. Given a research query, iteration summaries, \
 and the most relevant retrieved content, produce a comprehensive answer.
 
+CRITICAL: Only cite URLs and sources that appear in the provided iteration data. \
+NEVER invent, guess, or hallucinate URLs. If a claim lacks a source in the data, \
+state it without a citation or note that the source was not found.
+
 Your response must:
 1. Reason step-by-step through the collected evidence (chain of thought).
 2. Cite sources when making claims (use collection names and source files).
@@ -31,7 +35,7 @@ Structure your response as:
 (comprehensive answer to the query)
 
 ## Sources
-(list of key sources cited)
+(ONLY URLs from the provided data — never fabricated)
 
 ## Gaps
 (any remaining unknowns or areas for further research)\
@@ -148,7 +152,9 @@ class Synthesizer:
             "\n---\n\n"
             "Based on all the evidence above, produce a comprehensive, "
             "well-cited synthesis that addresses EVERY item in the Research "
-            "Anchor's 'must_cover' list."
+            "Anchor's 'must_cover' list.\n"
+            "IMPORTANT: In the Sources section, list ONLY URLs that appear "
+            "verbatim in the iteration data above. Do NOT fabricate or guess any URLs."
         )
 
         return "\n\n".join(parts)
