@@ -270,11 +270,25 @@ class _SubAgent:
         from open_webui.utils.chat import generate_chat_completion
         from open_webui.models.users import UserModel
 
+        # OWUI injects its own system prompt into generate_chat_completion.
+        # To ensure our instructions aren't diluted, we merge them into
+        # the user message. For web-search calls the search query must
+        # appear first so OWUI's search-extraction picks it up.
+        if enable_web_search:
+            combined = (
+                f"{user_prompt}\n\n"
+                f"---\nINSTRUCTIONS (follow these exactly):\n{system_prompt}"
+            )
+        else:
+            combined = (
+                f"INSTRUCTIONS (follow these exactly):\n{system_prompt}\n\n"
+                f"---\nINPUT:\n{user_prompt}"
+            )
+
         form_data = {
             "model": self._model_id,
             "messages": [
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_prompt},
+                {"role": "user", "content": combined},
             ],
             "stream": False,
             "metadata": {
