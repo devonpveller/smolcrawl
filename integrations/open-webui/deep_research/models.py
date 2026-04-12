@@ -1,0 +1,182 @@
+"""
+Data models, configuration, and valve definitions for Deep Research.
+
+Single Responsibility: Only defines data structures and validation.
+Open/Closed: Extend via subclassing or adding new fields.
+"""
+
+import hashlib
+from dataclasses import dataclass, field
+from datetime import datetime
+from enum import Enum
+from typing import Dict, List, Optional
+
+from pydantic import BaseModel, Field
+
+
+class ResearchPhase(str, Enum):
+    """Tracks current phase of a research session."""
+    INITIALIZING = "initializing"
+    DISCOVERING = "discovering"
+    AWAITING_APPROVAL = "awaiting_approval"
+    CRAWLING = "crawling"
+    RESEARCHING = "researching"
+    SYNTHESIZING = "synthesizing"
+    COMPLETE = "complete"
+    FAILED = "failed"
+
+
+class Valves(BaseModel):
+    """User-configurable settings for the Deep Research function."""
+
+    # SmolCrawl container connection (deep_research only)
+    smolcrawl_url: str = Field(
+        default="http://smolcrawl-pipelines:9099",
+        description="SmolCrawl pipeline container URL",
+    )
+    smolcrawl_api_key: str = Field(
+        default="0p3n-w3bu!",
+        description="Pipelines server API key",
+    )
+
+    # OWUI API
+    owui_base_url: str = Field(
+        default="http://openwebui:8080",
+        description="Open WebUI API base URL",
+    )
+    owui_api_key: str = Field(
+        default="",
+        description="Bearer token for OWUI API",
+    )
+
+    # Research settings (shared by research + deep_research)
+    max_iterations: int = Field(
+        default=3,
+        ge=1,
+        le=10,
+        description="Hard cap on RAG expansion iterations",
+    )
+    fixed_iterations: int = Field(
+        default=2,
+        ge=1,
+        le=5,
+        description="Guaranteed iterations before continue-decision",
+    )
+    max_web_results: int = Field(
+        default=10,
+        ge=1,
+        le=50,
+        description="Max web search results to store per query",
+    )
+    include_sources: bool = Field(
+        default=True,
+        description="Append source references to final answer",
+    )
+
+    # Deep research specific
+    top_k_per_collection: int = Field(
+        default=5,
+        ge=1,
+        le=20,
+        description="Chunks retrieved per collection per query",
+    )
+    max_collections: int = Field(
+        default=10,
+        ge=1,
+        le=50,
+        description="Max collections to search",
+    )
+    max_domains: int = Field(
+        default=5,
+        ge=1,
+        le=20,
+        description="Max domains to discover via web search",
+    )
+
+    # Fileshed integration
+    fileshed_compatible: bool = Field(
+        default=True,
+        description="Write journal to Fileshed Storage zone",
+    )
+    storage_base_path: str = Field(
+        default="/app/backend/data/user_files",
+        description="Base path for Fileshed-compatible storage",
+    )
+    save_journal: bool = Field(
+        default=True,
+        description="Persist research journal to disk",
+    )
+
+
+@dataclass
+class DiscoveredDomain:
+    """A domain discovered via web search with LLM scoring."""
+    url: str
+    domain: str
+    score: float
+    rationale: str
+    already_covered: bool = False
+    existing_collection_id: Optional[str] = None
+
+
+@dataclass
+class CrawlResult:
+    """Result of crawling a single domain via SmolCrawl."""
+    domain: str
+    kb_name: str
+    kb_id: str = ""
+    pages_crawled: int = 0
+    success: bool = False
+    error: str = ""
+    duration_seconds: float = 0.0
+
+
+@dataclass
+class RetrievedChunk:
+    """A single RAG chunk retrieved from a knowledge collection."""
+    content: str
+    collection_id: str
+    collection_name: str
+    source: str = ""
+    distance: float = 0.0
+
+    @property
+    def chunk_hash(self) -> str:
+        """Content-based hash for deduplication."""
+        return hashlib.sha256(self.content.encode()).hexdigest()[:16]
+
+
+@dataclass
+class IterationResult:
+    """Result of a single RAG research iteration."""
+    iteration_number: int
+    search_terms: List[str]
+    collections_queried: List[str]
+    chunks_found: int
+    new_chunks: int
+    summary: str = ""
+    new_concepts: List[str] = field(default_factory=list)
+
+
+@dataclass
+class ResearchSession:
+    """Mutable state for an in-progress research session."""
+    session_id: str
+    query: str
+    session_dir: str
+    phase: ResearchPhase = ResearchPhase.INITIALIZING
+    discovered_domains: List[DiscoveredDomain] = field(default_factory=list)
+    crawl_results: List[CrawlResult] = field(default_factory=list)
+    iterations: List[IterationResult] = field(default_factory=list)
+    relevant_collection_ids: List[str] = field(default_factory=list)
+    seen_chunk_keys: set = field(default_factory=set)
+    created_at: datetime = field(default_factory=datetime.utcnow)
+    model_id: str = ""
+
+    def add_seen_chunk(self, collection_id: str, chunk_hash: str) -> bool:
+        """Track a chunk as seen. Returns True if it was new."""
+        key = (collection_id, chunk_hash)
+        if key in self.seen_chunk_keys:
+            return False
+        self.seen_chunk_keys.add(key)
+        return True
