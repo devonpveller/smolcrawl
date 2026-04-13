@@ -742,7 +742,8 @@ class _Synthesizer:
 
     async def synthesize(self, session: ResearchSession, request, user: Dict,
                           relevant_sources: List[Dict] = None,
-                          trail_sources: List[Dict] = None) -> str:
+                          trail_sources: List[Dict] = None,
+                          event_emitter: Callable = None) -> str:
         prompt_md = self._j.read_entry(session.session_dir, "00-prompt.md")
         iter_mds = []
         for it in session.iterations:
@@ -797,12 +798,33 @@ class _Synthesizer:
             answer = await self._sa.run(_SYNTHESIS_PROMPT, "\n\n".join(parts), request, user)
 
             # Post-synthesis: programmatic URL scrubbing
+            await _emit(event_emitter, "🔗 Validating URLs against collected sources...")
             answer, scrubbed = self._scrub_fabricated_urls(answer, known_urls)
             if scrubbed:
                 logger.warning("Scrubbed %d fabricated URL(s)", len(scrubbed))
+                await _emit(event_emitter, f"⚠️ Removed {len(scrubbed)} fabricated URL(s)")
+            else:
+                await _emit(event_emitter, "✅ All URLs verified against sources")
 
             # Post-synthesis: LLM verification pass
+            await _emit(event_emitter, "🔍 Running credibility verification (checking claims, terminology, scope)...")
             verification = await self._verify(answer, all_sources, session, request, user)
+            credibility = verification.get("overall_credibility", "unknown")
+            issues = verification.get("issues", [])
+            critical_count = sum(1 for i in issues if isinstance(i, dict) and i.get("severity") == "critical")
+            warning_count = sum(1 for i in issues if isinstance(i, dict) and i.get("severity") == "warning")
+
+            if critical_count:
+                await _emit(event_emitter, f"🔴 Verification: {critical_count} critical issue(s), credibility={credibility}")
+            elif warning_count:
+                await _emit(event_emitter, f"🟡 Verification: {warning_count} warning(s), credibility={credibility}")
+            elif credibility in ("unknown", "very_low"):
+                await _emit(event_emitter, f"⚪ Verification inconclusive — credibility={credibility}")
+            else:
+                await _emit(event_emitter, f"✅ Verification passed — credibility={credibility}")
+
+            # Write verification results to journal
+            self._write_verification_journal(session, verification, scrubbed, all_sources)
 
             # Append credibility report
             report = self._credibility_report(verification, scrubbed, all_sources)
@@ -818,6 +840,48 @@ class _Synthesizer:
             self._j.write_synthesis(session, fb)
             self._j.write_manifest(session)
             return fb
+
+    def _write_verification_journal(self, session: ResearchSession,
+                                     verification: Dict, scrubbed: List[str],
+                                     sources: List[Dict]) -> None:
+        """Write verification results as a separate journal entry."""
+        lines = ["# Verification Report\n"]
+        credibility = verification.get("overall_credibility", "unknown")
+        lines.append(f"**Overall credibility:** {credibility}\n")
+        lines.append(f"**Recommendation:** {verification.get('recommendation', 'unknown')}\n")
+        lines.append(f"**Sources checked:** {len(sources)}\n")
+
+        if scrubbed:
+            lines.append(f"\n## Fabricated URLs Removed ({len(scrubbed)})\n")
+            for url in scrubbed:
+                lines.append(f"- {url}\n")
+
+        issues = verification.get("issues", [])
+        if issues:
+            lines.append(f"\n## Issues Found ({len(issues)})\n")
+            for issue in issues:
+                if isinstance(issue, dict):
+                    sev = issue.get("severity", "?")
+                    itype = issue.get("type", "?")
+                    detail = issue.get("detail", "")
+                    loc = issue.get("location", "")[:100]
+                    lines.append(f"- **[{sev}] {itype}**: {detail}\n")
+                    if loc:
+                        lines.append(f"  > {loc}\n")
+        else:
+            lines.append("\n## No issues found\n")
+
+        url_check = verification.get("url_check", {})
+        if url_check:
+            fab = url_check.get("fabricated", [])
+            if fab:
+                lines.append(f"\n## URL Cross-Check\n")
+                lines.append(f"- URLs in synthesis: {len(url_check.get('urls_in_synthesis', []))}\n")
+                lines.append(f"- URLs in sources: {len(url_check.get('urls_in_sources', []))}\n")
+                lines.append(f"- Fabricated (LLM-detected): {len(fab)}\n")
+
+        fn = f"{len(session.iterations) + 3:02d}-verification.md"
+        self._j.write_entry(session.session_dir, fn, "\n".join(lines))
 
     @staticmethod
     def _extract_known_urls(sources: List[Dict]) -> set:
@@ -1164,7 +1228,8 @@ class _QuickResearcher:
         await _emit(emitter, f"\U0001f9e0 Synthesizing ({len(relevant_sources)} relevant + {len(trail_sources)} trail sources)...")
         answer = await self._synth.synthesize(session, request, user,
                                                relevant_sources=relevant_sources,
-                                               trail_sources=trail_sources)
+                                               trail_sources=trail_sources,
+                                               event_emitter=emitter)
         session.phase = ResearchPhase.COMPLETE
         await _emit(emitter, f"\U0001f4c1 Journal: research/{slug}/", done=True)
 
@@ -1463,7 +1528,8 @@ class Tools:
         # --- Phase 4: Synthesize ---
         session.phase = ResearchPhase.SYNTHESIZING
         await _emit(__event_emitter__, "🧠 Synthesizing findings...")
-        answer = await synth.synthesize(session, __request__, __user__ or {})
+        answer = await synth.synthesize(session, __request__, __user__ or {},
+                                        event_emitter=__event_emitter__)
         session.phase = ResearchPhase.COMPLETE
         await _emit(__event_emitter__, f"📁 Journal: deep-research/{slug}/", done=True)
         return answer

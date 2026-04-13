@@ -267,7 +267,8 @@ class Tools:
         )
 
         answer = await synthesizer.synthesize(
-            session, __request__, __user__ or {}
+            session, __request__, __user__ or {},
+            event_emitter=__event_emitter__,
         )
 
         session.phase = ResearchPhase.COMPLETE

@@ -7,7 +7,7 @@ Includes post-synthesis verification to catch hallucinations and fabricated cont
 
 import logging
 import re
-from typing import Any, Dict, List, Set
+from typing import Any, Callable, Dict, List, Optional, Set
 from urllib.parse import urlparse
 
 from .journal import ResearchJournal
@@ -134,6 +134,7 @@ class Synthesizer:
         user: Dict,
         relevant_sources: List[Dict] = None,
         trail_sources: List[Dict] = None,
+        event_emitter: Callable = None,
     ) -> str:
         """Produce a final synthesis from all research iterations.
 
@@ -189,6 +190,7 @@ class Synthesizer:
             # --- Post-synthesis validation pipeline ---
 
             # Step 1: Programmatic URL scrubbing (fast, deterministic)
+            await self._emit(event_emitter, "🔗 Validating URLs against collected sources...")
             answer, scrub_report = self._scrub_fabricated_urls(
                 answer, known_urls
             )
@@ -197,10 +199,56 @@ class Synthesizer:
                     "Scrubbed %d fabricated URL(s) from synthesis",
                     len(scrub_report),
                 )
+                await self._emit(
+                    event_emitter,
+                    f"⚠️ Removed {len(scrub_report)} fabricated URL(s)",
+                )
+            else:
+                await self._emit(event_emitter, "✅ All URLs verified against sources")
 
             # Step 2: LLM-based verification pass
+            await self._emit(
+                event_emitter,
+                "🔍 Running credibility verification (checking claims, terminology, scope)...",
+            )
             verification = await self._verify_synthesis(
                 answer, all_sources, session, request, user
+            )
+            credibility = verification.get("overall_credibility", "unknown")
+            issues = verification.get("issues", [])
+            critical_count = sum(
+                1 for i in issues
+                if isinstance(i, dict) and i.get("severity") == "critical"
+            )
+            warning_count = sum(
+                1 for i in issues
+                if isinstance(i, dict) and i.get("severity") == "warning"
+            )
+
+            if critical_count:
+                await self._emit(
+                    event_emitter,
+                    f"🔴 Verification: {critical_count} critical issue(s), credibility={credibility}",
+                )
+            elif warning_count:
+                await self._emit(
+                    event_emitter,
+                    f"🟡 Verification: {warning_count} warning(s), credibility={credibility}",
+                )
+            elif credibility in ("unknown", "very_low"):
+                await self._emit(
+                    event_emitter,
+                    f"⚪ Verification inconclusive — credibility={credibility}",
+                )
+            else:
+                await self._emit(
+                    event_emitter,
+                    f"✅ Verification passed — credibility={credibility}",
+                )
+
+            # Write verification results to journal
+            self._write_verification_journal(
+                session, verification, scrub_report, all_sources
             )
 
             # Step 3: Append credibility report
@@ -564,3 +612,72 @@ class Synthesizer:
             )
 
         return "".join(parts)
+
+    @staticmethod
+    async def _emit(
+        event_emitter: Optional[Callable],
+        message: str,
+        done: bool = False,
+    ) -> None:
+        """Emit a status message visible to the end user."""
+        if event_emitter:
+            await event_emitter(
+                {
+                    "type": "status",
+                    "data": {"description": message, "done": done},
+                }
+            )
+
+    def _write_verification_journal(
+        self,
+        session: ResearchSession,
+        verification: Dict,
+        scrubbed: List[str],
+        sources: List[Dict],
+    ) -> None:
+        """Write verification results as a separate journal entry."""
+        lines = ["# Verification Report\n"]
+        credibility = verification.get("overall_credibility", "unknown")
+        lines.append(f"**Overall credibility:** {credibility}\n")
+        lines.append(
+            f"**Recommendation:** {verification.get('recommendation', 'unknown')}\n"
+        )
+        lines.append(f"**Sources checked:** {len(sources)}\n")
+
+        if scrubbed:
+            lines.append(f"\n## Fabricated URLs Removed ({len(scrubbed)})\n")
+            for url in scrubbed:
+                lines.append(f"- {url}\n")
+
+        issues = verification.get("issues", [])
+        if issues:
+            lines.append(f"\n## Issues Found ({len(issues)})\n")
+            for issue in issues:
+                if isinstance(issue, dict):
+                    sev = issue.get("severity", "?")
+                    itype = issue.get("type", "?")
+                    detail = issue.get("detail", "")
+                    loc = issue.get("location", "")[:100]
+                    lines.append(f"- **[{sev}] {itype}**: {detail}\n")
+                    if loc:
+                        lines.append(f"  > {loc}\n")
+        else:
+            lines.append("\n## No issues found\n")
+
+        url_check = verification.get("url_check", {})
+        if url_check:
+            fab = url_check.get("fabricated", [])
+            if fab:
+                lines.append("\n## URL Cross-Check\n")
+                lines.append(
+                    f"- URLs in synthesis: "
+                    f"{len(url_check.get('urls_in_synthesis', []))}\n"
+                )
+                lines.append(
+                    f"- URLs in sources: "
+                    f"{len(url_check.get('urls_in_sources', []))}\n"
+                )
+                lines.append(f"- Fabricated (LLM-detected): {len(fab)}\n")
+
+        filename = f"{len(session.iterations) + 3:02d}-verification.md"
+        self._journal.write_entry(session.session_dir, filename, "\n".join(lines))

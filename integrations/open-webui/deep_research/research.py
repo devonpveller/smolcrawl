@@ -298,6 +298,7 @@ class QuickResearcher:
             session, request, user,
             relevant_sources=relevant_sources,
             trail_sources=trail_sources,
+            event_emitter=event_emitter,
         )
         session.phase = ResearchPhase.COMPLETE
         await self._emit_status(
