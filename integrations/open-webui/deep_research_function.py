@@ -682,18 +682,55 @@ class _RagResearcher:
 # =============================================================================
 
 _SYNTHESIS_PROMPT = """\
-You are a research synthesizer. Given a research query, iteration summaries, \
-and relevant content, produce a comprehensive answer.
+You are a **source-grounded** research synthesizer. You may ONLY make claims \
+that are directly supported by the provided evidence. You are NOT a general \
+knowledge assistant — treat this as a courtroom: no evidence, no claim.
 
-CRITICAL: Only cite URLs and sources that appear in the provided iteration data. \
-NEVER invent, guess, or hallucinate URLs. If a claim lacks a source in the data, \
-state it without a citation or note that the source was not found.
+## Hard Rules
+1. **Source-grounded claims only.** Every factual statement must trace to a \
+specific Collected Source by number (e.g. [Source 3]). If no source supports \
+a claim, do NOT make it — instead note it as a gap.
+2. **ZERO fabricated URLs.** The Sources section must contain ONLY URLs copied \
+verbatim from the Collected Sources list. A synthesis with fabricated URLs is \
+a failed synthesis.
+3. **No gap-filling from training data.** If the collected evidence is \
+insufficient to answer part of the query, say so explicitly in the Gaps \
+section. Do NOT fill in missing information from your general knowledge.
+4. **No generic templates.** Your answer must be specific to the actual \
+evidence collected. If sources only cover surface-level information, \
+produce a surface-level answer and flag the depth gap.
+5. **Verify terminology.** If sources use a specific term for a technology, \
+framework, or concept, use that exact term. Do NOT substitute similar-sounding \
+technologies.
+6. **Confidence tagging.** Mark each major claim: \
+[SOURCED] — directly stated in a source, \
+[INFERRED] — reasonable inference from multiple sources, \
+[UNCERTAIN] — mentioned but not well-supported.
+7. **Scope fidelity.** Answer ONLY what the Research Anchor asks. Match the \
+requested format and depth.
 
 Structure:
-## Reasoning  (step-by-step chain of thought)
-## Answer     (comprehensive answer)
-## Sources    (ONLY URLs from the provided data — never fabricated)
-## Gaps       (remaining unknowns)\
+### Reasoning  (step-by-step, reference sources by number)
+### Answer     (comprehensive, every claim tagged)
+### Confidence Assessment  (evidence quality, source diversity, notable gaps)
+### Sources    (ONLY URLs from Collected Sources list)
+### Gaps & Limitations  (what evidence does NOT cover)\
+"""
+
+_VERIFICATION_PROMPT = """\
+You are a factual accuracy reviewer. Given a research synthesis and the \
+original source data it was built from, identify problems.
+
+Check for: 1) Fabricated URLs not in Collected Sources, 2) Unsupported claims, \
+3) Technology misidentification, 4) Generic template content, 5) Scope mismatch, \
+6) Fabricated examples/code/commands.
+
+Return JSON:
+{"issues": [{"type": "fabricated_url|unsupported_claim|misidentification|generic_template|scope_mismatch|fabricated_example",
+"severity": "critical|warning", "detail": "description", "location": "quote first 100 chars"}],
+"url_check": {"urls_in_synthesis": [], "urls_in_sources": [], "fabricated": []},
+"overall_credibility": "high|medium|low|very_low",
+"recommendation": "pass|revise|flag_for_user"}\
 """
 
 
@@ -714,6 +751,9 @@ class _Synthesizer:
             if c:
                 iter_mds.append(c)
 
+        all_sources = (relevant_sources or []) + (trail_sources or [])
+        known_urls = self._extract_known_urls(all_sources)
+
         parts = [f"# Research Anchor\n\n{session.anchor}\n"]
         parts.append(f"# Original Query\n\n{session.query}\n")
         if prompt_md:
@@ -722,24 +762,53 @@ class _Synthesizer:
             parts.append(f"# Iteration {i}\n\n{md}\n")
 
         # Include the actual source data so the LLM can cite real URLs
-        all_sources = (relevant_sources or []) + (trail_sources or [])
         if all_sources:
-            parts.append("# Collected Sources\n")
-            parts.append("These are the actual web sources found during research. "
-                         "Use these URLs in your Sources section.\n")
+            parts.append("# Collected Sources (EXHAUSTIVE LIST)\n")
+            parts.append("These are the ONLY sources found during research. "
+                         "Your answer must be built EXCLUSIVELY from this evidence. "
+                         "Reference sources by number [Source N]. "
+                         "The Sources section of your answer must ONLY contain URLs "
+                         "from this list — copied exactly, character for character.\n")
             for i, s in enumerate(all_sources, 1):
                 parts.append(
-                    f"{i}. **{s.get('title', 'Untitled')}**\n"
+                    f"[Source {i}] **{s.get('title', 'Untitled')}**\n"
                     f"   - URL: {s.get('url', 'N/A')}\n"
                     f"   - Domain: {s.get('domain', '')}\n"
                     f"   - Summary: {s.get('summary', '')}\n"
                 )
+        else:
+            parts.append("# Collected Sources\n\n"
+                         "**NO sources were collected.** Your synthesis must state "
+                         "that the research found no relevant sources. Do NOT "
+                         "generate an answer from general knowledge.\n")
 
-        parts.append("\n---\nProduce a comprehensive synthesis that addresses EVERY item in the Research Anchor's 'must_cover' list.\n"
-                     "IMPORTANT: In the Sources section, list ONLY URLs from the 'Collected Sources' section above. Do NOT fabricate or guess any URLs.")
+        source_count = len(all_sources)
+        parts.append(
+            f"\n---\nYou have {source_count} source(s) to work with.\n"
+            "- Address EVERY item in the Research Anchor's 'must_cover' list.\n"
+            "- For items NOT covered by any source, list them in Gaps.\n"
+            "- In Sources, list ONLY URLs that appear verbatim in Collected Sources.\n"
+            "- If evidence is insufficient, produce a SHORTER answer that honestly "
+            "reflects what the evidence supports. Do NOT pad with general knowledge.\n"
+            "- Tag each factual claim: [SOURCED], [INFERRED], or [UNCERTAIN]."
+        )
 
         try:
             answer = await self._sa.run(_SYNTHESIS_PROMPT, "\n\n".join(parts), request, user)
+
+            # Post-synthesis: programmatic URL scrubbing
+            answer, scrubbed = self._scrub_fabricated_urls(answer, known_urls)
+            if scrubbed:
+                logger.warning("Scrubbed %d fabricated URL(s)", len(scrubbed))
+
+            # Post-synthesis: LLM verification pass
+            verification = await self._verify(answer, all_sources, session, request, user)
+
+            # Append credibility report
+            report = self._credibility_report(verification, scrubbed, all_sources)
+            if report:
+                answer += report
+
             self._j.write_synthesis(session, answer)
             self._j.write_manifest(session)
             return answer
@@ -749,6 +818,124 @@ class _Synthesizer:
             self._j.write_synthesis(session, fb)
             self._j.write_manifest(session)
             return fb
+
+    @staticmethod
+    def _extract_known_urls(sources: List[Dict]) -> set:
+        urls = set()
+        for s in sources:
+            url = s.get("url", "")
+            if url and url != "N/A":
+                urls.add(url)
+                stripped = url.rstrip("/")
+                urls.add(stripped)
+                urls.add(stripped + "/")
+        return urls
+
+    @staticmethod
+    def _extract_urls_from_text(text: str) -> List[str]:
+        import re as _re
+        patterns = [
+            r'\[.*?\]\((https?://[^\s\)]+)\)',
+            r'(?<!\()(https?://[^\s\)\]>"]+)',
+        ]
+        found = []
+        for pat in patterns:
+            for match in _re.finditer(pat, text):
+                url = match.group(1) if match.lastindex else match.group(0)
+                found.append(url)
+        return list(dict.fromkeys(found))
+
+    @staticmethod
+    def _scrub_fabricated_urls(text: str, known_urls: set) -> tuple:
+        import re as _re
+        if not known_urls:
+            return text, []
+        urls_in_text = _Synthesizer._extract_urls_from_text(text)
+        fabricated = []
+        for url in urls_in_text:
+            url_clean = url.rstrip("/")
+            if not (url in known_urls or url_clean in known_urls or url_clean + "/" in known_urls):
+                fabricated.append(url)
+        if not fabricated:
+            return text, []
+        cleaned = text
+        for url in fabricated:
+            cleaned = _re.sub(
+                r'\[([^\]]*)\]\(' + _re.escape(url) + r'\)',
+                r'[\1] *(URL removed — not found in collected sources)*',
+                cleaned,
+            )
+            cleaned = cleaned.replace(url, f"~~{url}~~ *(fabricated — not in collected sources)*")
+        return cleaned, fabricated
+
+    async def _verify(self, synthesis: str, sources: List[Dict],
+                       session: ResearchSession, request, user: Dict) -> Dict:
+        if not sources:
+            return {"issues": [], "overall_credibility": "very_low", "recommendation": "flag_for_user"}
+        source_list = "\n".join(
+            f"[Source {i}] {s.get('title', '?')} — {s.get('url', 'N/A')}"
+            for i, s in enumerate(sources, 1)
+        )
+        try:
+            result = await self._sa.run_json(
+                _VERIFICATION_PROMPT,
+                f"# Research Anchor\n{session.anchor}\n\n# Collected Sources\n{source_list}\n\n# Synthesis to Verify\n{synthesis}",
+                request, user,
+            )
+            if isinstance(result, dict):
+                return result
+            return {"issues": [], "overall_credibility": "medium", "recommendation": "pass"}
+        except Exception as e:
+            logger.warning("Verification failed: %s", e)
+            return {"issues": [], "overall_credibility": "unknown", "recommendation": "pass"}
+
+    @staticmethod
+    def _credibility_report(verification: Dict, scrubbed: List[str], sources: List[Dict]) -> str:
+        parts = []
+        credibility = verification.get("overall_credibility", "unknown")
+        issues = verification.get("issues", [])
+        critical = [i for i in issues if isinstance(i, dict) and i.get("severity") == "critical"]
+        warnings = [i for i in issues if isinstance(i, dict) and i.get("severity") == "warning"]
+
+        parts.append("\n\n---\n\n## Research Credibility Report\n")
+        source_count = len(sources)
+        if source_count == 0:
+            parts.append("⚠️ **No sources collected.** This synthesis has no evidentiary basis.\n")
+        else:
+            domains = len(set(s.get("domain", "") for s in sources if s.get("domain")))
+            parts.append(f"- **Evidence basis:** {source_count} source(s) from {domains} domain(s)\n")
+
+        labels = {
+            "high": "🟢 High — claims well-supported by diverse sources",
+            "medium": "🟡 Medium — some claims supported, gaps remain",
+            "low": "🟠 Low — thin evidence, significant gaps",
+            "very_low": "🔴 Very Low — insufficient evidence for reliable conclusions",
+            "unknown": "⚪ Unknown — verification could not be completed",
+        }
+        parts.append(f"- **Credibility:** {labels.get(credibility, credibility)}\n")
+
+        if scrubbed:
+            parts.append(f"\n### ⚠️ Fabricated URLs Removed ({len(scrubbed)})\n")
+            for url in scrubbed:
+                parts.append(f"- ~~{url}~~\n")
+
+        if critical:
+            parts.append(f"\n### 🔴 Critical Issues ({len(critical)})\n")
+            for i in critical:
+                parts.append(f"- **{i.get('type', '?')}**: {i.get('detail', '')}\n")
+
+        if warnings:
+            parts.append(f"\n### 🟡 Warnings ({len(warnings)})\n")
+            for i in warnings:
+                parts.append(f"- **{i.get('type', '?')}**: {i.get('detail', '')}\n")
+
+        rec = verification.get("recommendation", "pass")
+        if rec == "revise":
+            parts.append("\n**⚠️ Recommendation:** Cross-check key claims before relying on them.\n")
+        elif rec == "flag_for_user":
+            parts.append("\n**🔴 Recommendation:** Evidence insufficient. Consider `deep_research()` or refine query.\n")
+
+        return "".join(parts)
 
     @staticmethod
     def _fallback(session: ResearchSession) -> str:
@@ -768,23 +955,30 @@ class _Synthesizer:
 # _WEB_SEARCH_PROMPT removed — search results now come directly from search_web()
 
 _RELEVANCE_GATE_PROMPT = """\
-You are a strict relevance judge. Given a RESEARCH ANCHOR and a list of \
-web search results, judge each result.
+You are a strict relevance AND credibility judge. Given a RESEARCH ANCHOR \
+and a list of web search results, judge each result on TWO axes.
 
-For EACH result, decide:
+**Axis 1 — Relevance:**
 - "relevant": addresses the anchor's topic area, key concepts, or must_cover \
-items — even if only partially. A page title or snippet that mentions the \
-core subject IS relevant. Err on the side of inclusion.
-- "trail": tangentially related — about the broader field but not the \
-specific topic. Also use for contrasting viewpoints or adjacent tools.
+items — even if only partially. Err on the side of inclusion.
+- "trail": tangentially related — broader field but not the specific topic.
 - "drop": completely off-topic, about a different subject entirely.
 
+**Axis 2 — Source Authority (0.0–1.0):**
+- 1.0: Official documentation, primary project source, RFC/spec
+- 0.8: Established tech publications (MDN, DigitalOcean, etc.)
+- 0.6: Reputable blog posts, Stack Overflow accepted answers
+- 0.4: Forum posts, personal blogs, undated content
+- 0.2: Content farms, AI-generated summaries, aggregator sites
+- 0.0: Obvious spam, placeholder, or fabricated content
+
 Return JSON array in the same order as the input:
-[{{"index": 0, "verdict": "relevant"|"trail"|"drop", "reason": "one sentence"}}]
+[{{"index": 0, "verdict": "relevant"|"trail"|"drop", "authority": 0.0-1.0, \
+"reason": "one sentence"}}]
 
 IMPORTANT: You are judging based on short search snippets, not full articles. \
-Be generous — if the title or snippet plausibly relates to the anchor, mark it \
-"relevant". Only "drop" truly unrelated results.
+Be generous with relevance — if the title or snippet plausibly relates to the \
+anchor, mark it "relevant". Only "drop" truly unrelated results.
 Respond ONLY with valid JSON.\
 """
 
@@ -1034,11 +1228,15 @@ class _QuickResearcher:
                 idx = v.get("index", -1)
                 if 0 <= idx < len(sources):
                     verdict = v.get("verdict", "drop")
+                    authority = v.get("authority", 0.5)
+                    sources[idx]["authority"] = authority
+                    sources[idx]["gate_reason"] = v.get("reason", "")
                     if verdict == "relevant":
                         relevant.append(sources[idx])
                     elif verdict == "trail":
                         trail.append(sources[idx])
             dropped = len(sources) - len(relevant) - len(trail)
+            relevant.sort(key=lambda s: s.get("authority", 0.5), reverse=True)
             logger.info("Relevance gate: %d relevant, %d trail, %d dropped", len(relevant), len(trail), dropped)
             return relevant, trail, dropped
         except Exception:

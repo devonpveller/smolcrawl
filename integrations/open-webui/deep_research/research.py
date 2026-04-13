@@ -21,10 +21,10 @@ logger = logging.getLogger("deep_research.research")
 # Web search results now come directly from OWUI's search_web() function.
 
 _RELEVANCE_GATE_PROMPT = """\
-You are a strict relevance judge. Given a RESEARCH ANCHOR and a list of \
-web search results, judge each result.
+You are a strict relevance AND credibility judge. Given a RESEARCH ANCHOR \
+and a list of web search results, judge each result on TWO axes.
 
-For EACH result, decide:
+**Axis 1 — Relevance:**
 - "relevant": addresses the anchor's topic area, key concepts, or must_cover \
 items — even if only partially. A page title or snippet that mentions the \
 core subject IS relevant. Err on the side of inclusion.
@@ -32,12 +32,21 @@ core subject IS relevant. Err on the side of inclusion.
 specific topic. Also use for contrasting viewpoints or adjacent tools.
 - "drop": completely off-topic, about a different subject entirely.
 
+**Axis 2 — Source Authority (0.0–1.0):**
+- 1.0: Official documentation, primary project source, RFC/spec
+- 0.8: Established tech publications (MDN, DigitalOcean, etc.)
+- 0.6: Reputable blog posts, Stack Overflow accepted answers
+- 0.4: Forum posts, personal blogs, undated content
+- 0.2: Content farms, AI-generated summaries, aggregator sites
+- 0.0: Obvious spam, placeholder, or fabricated content
+
 Return JSON array in the same order as the input:
-[{{"index": 0, "verdict": "relevant"|"trail"|"drop", "reason": "one sentence"}}]
+[{{"index": 0, "verdict": "relevant"|"trail"|"drop", "authority": 0.0-1.0, \
+"reason": "one sentence"}}]
 
 IMPORTANT: You are judging based on short search snippets, not full articles. \
-Be generous — if the title or snippet plausibly relates to the anchor, mark it \
-"relevant". Only "drop" truly unrelated results.
+Be generous with relevance — if the title or snippet plausibly relates to the \
+anchor, mark it "relevant". Only "drop" truly unrelated results.
 Respond ONLY with valid JSON.\
 """
 
@@ -374,11 +383,16 @@ class QuickResearcher:
                 idx = v.get("index", -1)
                 if 0 <= idx < len(sources):
                     verdict = v.get("verdict", "drop")
+                    authority = v.get("authority", 0.5)
+                    sources[idx]["authority"] = authority
+                    sources[idx]["gate_reason"] = v.get("reason", "")
                     if verdict == "relevant":
                         relevant.append(sources[idx])
                     elif verdict == "trail":
                         trail.append(sources[idx])
             dropped = len(sources) - len(relevant) - len(trail)
+            # Sort relevant sources by authority (highest first)
+            relevant.sort(key=lambda s: s.get("authority", 0.5), reverse=True)
             logger.info(
                 "Relevance gate: %d relevant, %d trail, %d dropped",
                 len(relevant), len(trail), dropped,
