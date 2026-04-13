@@ -18,41 +18,26 @@ from .synthesis import Synthesizer
 
 logger = logging.getLogger("deep_research.research")
 
-_WEB_SEARCH_SYSTEM_PROMPT = """\
-You have web search results for the user's query. Reformat ALL search \
-results into a JSON array.
-
-Rules:
-- Include EVERY result the search returned \u2014 do not filter or skip any.
-- For each result, extract: url, domain, title, summary (2-3 sentences), \
-relevance (0.0-1.0 vs the RESEARCH ANCHOR below).
-- Prefer diverse sources: include results from different organizations, \
-academic papers, independent blogs, and contrasting viewpoints \u2014 not just \
-the company or person mentioned in the query.
-
-RESEARCH ANCHOR (for relevance scoring only):
-{anchor}
-
-Return JSON array: [{{"url":"...","domain":"...","title":"...","summary":"2-3 sentences","relevance":0.0-1.0}}]
-Return at most {max_results} results. Respond ONLY with valid JSON, no commentary.\
-"""
+# Web search results now come directly from OWUI's search_web() function.
 
 _RELEVANCE_GATE_PROMPT = """\
 You are a strict relevance judge. Given a RESEARCH ANCHOR and a list of \
 web search results, judge each result.
 
 For EACH result, decide:
-- "relevant": directly addresses one or more key concepts / must_cover items from the anchor
-- "trail": partially related \u2014 it may not answer the query directly but \
-could lead to deeper sources. Also use "trail" for contrasting viewpoints \
-or alternative approaches that are still within the anchor's domain.
-- "drop": completely off-topic, about a different subject, or too vague
+- "relevant": addresses the anchor's topic area, key concepts, or must_cover \
+items — even if only partially. A page title or snippet that mentions the \
+core subject IS relevant. Err on the side of inclusion.
+- "trail": tangentially related — about the broader field but not the \
+specific topic. Also use for contrasting viewpoints or adjacent tools.
+- "drop": completely off-topic, about a different subject entirely.
 
 Return JSON array in the same order as the input:
 [{{"index": 0, "verdict": "relevant"|"trail"|"drop", "reason": "one sentence"}}]
 
-Be strict for "relevant" but generous for "trail" \u2014 contrasting or \
-competing perspectives within the domain are valuable trail sources.
+IMPORTANT: You are judging based on short search snippets, not full articles. \
+Be generous — if the title or snippet plausibly relates to the anchor, mark it \
+"relevant". Only "drop" truly unrelated results.
 Respond ONLY with valid JSON.\
 """
 
@@ -172,12 +157,11 @@ class QuickResearcher:
                 break
             tried_terms.update(new_terms)
 
-            combined = (
-                " OR ".join(f'"{t}"' for t in new_terms)
-                if len(new_terms) > 1
-                else new_terms[0]
-            )
-            raw = await self._web_search(session, combined, request, user)
+            # Search each term individually — OR-joining fails on most engines
+            raw = []
+            for term in new_terms[:3]:  # cap at 3 searches per iteration
+                hits = await self._web_search(session, term, request, user)
+                raw.extend(hits)
             raw = [r for r in raw if r.get("url", "") not in seen_urls]
             seen_urls.update(r.get("url", "") for r in raw)
 
@@ -224,14 +208,29 @@ class QuickResearcher:
                     f"+{len(trail)} trail \u2014 diving deeper",
                 )
             else:
-                consecutive_misses += 1
-                summary = f"No relevant hits (kept {len(trail)} trail, dropped {dropped}). Pivoting."
-                search_terms = await self._pivot(session, tried_terms, request, user)
-                await self._emit_status(
-                    event_emitter,
-                    f"\U0001f504 Iter {n}: 0 relevant, {len(trail)} trail "
-                    f"\u2014 pivoting ({consecutive_misses})",
-                )
+                # Trail sources indicate on-topic results — only a full miss
+                # when we get zero trail AND zero relevant
+                if trail:
+                    consecutive_misses = max(0, consecutive_misses)  # don't increment
+                    summary = f"No direct hits but {len(trail)} trail, dropped {dropped}. Refining."
+                    extraction = await self._extract_topics(
+                        session, [], trail, request, user
+                    )
+                    search_terms = extraction.get("deeper_terms", []) + extraction.get("adjacent_leads", [])
+                    if not search_terms:
+                        search_terms = await self._pivot(session, tried_terms, request, user)
+                    await self._emit_status(
+                        event_emitter,
+                        f"\U0001f504 Iter {n}: 0 relevant, {len(trail)} trail \u2014 refining",
+                    )
+                else:
+                    consecutive_misses += 1
+                    summary = f"No results relevant to anchor. Pivoting (miss {consecutive_misses})."
+                    search_terms = await self._pivot(session, tried_terms, request, user)
+                    await self._emit_status(
+                        event_emitter,
+                        f"\U0001f504 Iter {n}: 0 results \u2014 pivoting ({consecutive_misses})",
+                    )
 
             it = IterationResult(n, new_terms, ["web_search"], len(raw), len(all_kept), summary, [])
             session.iterations.append(it)
@@ -286,23 +285,38 @@ class QuickResearcher:
     async def _web_search(
         self, session: ResearchSession, query: str, request: Any, user: Dict
     ) -> List[Dict]:
-        # CRITICAL: anchor goes in system prompt (guides LLM formatting),
-        # search query goes in user prompt ALONE (guides OWUI's web search).
-        system_prompt = _WEB_SEARCH_SYSTEM_PROMPT.format(
-            max_results=self._valves.max_web_results,
-            anchor=session.anchor,
-        )
-        try:
-            return await self._sub_agent.run_json(
-                system_prompt=system_prompt,
-                user_prompt=query,
-                request=request,
-                user=user,
-                enable_web_search=True,
-            )
-        except Exception as e:
-            logger.warning("Web search parse failed for query '%s': %s", query[:80], e)
+        """Call OWUI's search_web() directly — bypasses the LLM entirely."""
+        from open_webui.routers.retrieval import search_web
+        from starlette.concurrency import run_in_threadpool
+        from urllib.parse import urlparse
+
+        engine = getattr(request.app.state.config, "WEB_SEARCH_ENGINE", "")
+        if not engine:
+            logger.warning("No WEB_SEARCH_ENGINE configured in OWUI admin settings")
             return []
+
+        try:
+            results = await run_in_threadpool(search_web, request, engine, query)
+        except Exception as e:
+            logger.warning("search_web failed for '%s': %s", query[:80], e)
+            return []
+
+        parsed = []
+        for r in results[:self._valves.max_web_results]:
+            domain = ""
+            try:
+                domain = urlparse(r.link).netloc
+            except Exception:
+                pass
+            parsed.append({
+                "url": r.link,
+                "title": r.title or "",
+                "summary": r.snippet or "",
+                "domain": domain,
+            })
+
+        logger.info("Direct web search for '%s': %d results", query[:60], len(parsed))
+        return parsed
 
     # --- Relevance gate ---
 

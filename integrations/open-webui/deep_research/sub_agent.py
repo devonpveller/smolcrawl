@@ -12,6 +12,9 @@ from typing import Any, Dict, List, Optional
 
 logger = logging.getLogger("deep_research.sub_agent")
 
+# Web search is now handled by calling OWUI's search_web() directly in
+# research.py and domain_discovery.py — not through generate_chat_completion.
+
 
 class SubAgent:
     """Executes internal LLM calls using OWUI's generate_chat_completion.
@@ -30,7 +33,6 @@ class SubAgent:
         request: Any,
         user: Dict,
         metadata: Optional[Dict] = None,
-        enable_web_search: bool = False,
         json_mode: bool = False,
     ) -> str:
         """Execute a sub-agent LLM call.
@@ -41,7 +43,6 @@ class SubAgent:
             request: The OWUI __request__ object for auth context.
             user: The OWUI __user__ dict.
             metadata: Optional metadata to forward.
-            enable_web_search: Whether to enable web search for this call.
             json_mode: Whether to enforce JSON-only output framing.
 
         Returns:
@@ -50,10 +51,6 @@ class SubAgent:
         from open_webui.utils.chat import generate_chat_completion
         from open_webui.models.users import UserModel
 
-        # OWUI injects its own system prompt into generate_chat_completion.
-        # We still send a short system message to set the "role" — OWUI's
-        # system prompt is prepended but ours is appended, so the model
-        # still sees it.  For JSON calls we make the role unmistakable.
         if json_mode:
             sys_msg = ("You are a JSON data extraction API. "
                        "Respond with ONLY valid JSON. "
@@ -61,21 +58,10 @@ class SubAgent:
         else:
             sys_msg = "Follow the user's instructions precisely."
 
-        # For web-search calls the search query must appear first so
-        # OWUI's search-extraction picks it up.  We bracket the query
-        # with strong JSON-mode framing so the LLM can't miss it.
-        if enable_web_search:
-            combined = (
-                f"[JSON-ONLY MODE — respond with a JSON array, nothing else]\n\n"
-                f"{user_prompt}\n\n"
-                f"---\nINSTRUCTIONS (follow these exactly):\n{system_prompt}\n\n"
-                f"REMINDER: Output ONLY a valid JSON array. No text before or after."
-            )
-        else:
-            combined = (
-                f"INSTRUCTIONS (follow these exactly):\n{system_prompt}\n\n"
-                f"---\nINPUT:\n{user_prompt}"
-            )
+        combined = (
+            f"INSTRUCTIONS (follow these exactly):\n{system_prompt}\n\n"
+            f"---\nINPUT:\n{user_prompt}"
+        )
 
         form_data = {
             "model": self._model_id,
@@ -84,14 +70,7 @@ class SubAgent:
                 {"role": "user", "content": combined},
             ],
             "stream": False,
-            "metadata": {
-                "task": "deep_research_sub_agent",
-                **(
-                    {"features": {"web_search": True}}
-                    if enable_web_search
-                    else {}
-                ),
-            },
+            "metadata": {"task": "deep_research_sub_agent"},
         }
 
         response = await generate_chat_completion(
@@ -112,34 +91,14 @@ class SubAgent:
         request: Any,
         user: Dict,
         metadata: Optional[Dict] = None,
-        enable_web_search: bool = False,
     ) -> Any:
-        """Execute a sub-agent call and parse the response as JSON.
-
-        Falls back to extracting JSON from markdown code blocks if the
-        response isn't pure JSON.
-
-        Args:
-            system_prompt: System-level instructions.
-            user_prompt: The query for this sub-task.
-            request: OWUI __request__ object.
-            user: OWUI __user__ dict.
-            metadata: Optional metadata.
-            enable_web_search: Whether to enable web search.
-
-        Returns:
-            Parsed JSON object (dict or list).
-
-        Raises:
-            ValueError: If the response cannot be parsed as JSON.
-        """
+        """Call LLM and parse response as JSON."""
         raw = await self.run(
             system_prompt=system_prompt,
             user_prompt=user_prompt,
             request=request,
             user=user,
             metadata=metadata,
-            enable_web_search=enable_web_search,
             json_mode=True,
         )
         try:

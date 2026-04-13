@@ -261,20 +261,18 @@ async def _extract_anchor(sa: '_SubAgent', query: str, request, user: Dict) -> s
     return "\n".join(lines)
 
 
+# _WEB_SEARCH_LIST_PROMPT removed — we now call search_web() directly
+
+
 class _SubAgent:
     def __init__(self, model_id: str):
         self._model_id = model_id
 
     async def run(self, system_prompt: str, user_prompt: str, request, user: Dict,
-                  enable_web_search: bool = False,
                   json_mode: bool = False) -> str:
         from open_webui.utils.chat import generate_chat_completion
         from open_webui.models.users import UserModel
 
-        # OWUI injects its own system prompt into generate_chat_completion.
-        # We still send a short system message to set the "role" — OWUI's
-        # system prompt is prepended but ours is appended, so the model
-        # still sees it.  For JSON calls we make the role unmistakable.
         if json_mode:
             sys_msg = ("You are a JSON data extraction API. "
                        "Respond with ONLY valid JSON. "
@@ -282,21 +280,10 @@ class _SubAgent:
         else:
             sys_msg = "Follow the user's instructions precisely."
 
-        # For web-search calls the search query must appear first so
-        # OWUI's search-extraction picks it up.  We bracket the query
-        # with strong JSON-mode framing so the LLM can't miss it.
-        if enable_web_search:
-            combined = (
-                f"[JSON-ONLY MODE — respond with a JSON array, nothing else]\n\n"
-                f"{user_prompt}\n\n"
-                f"---\nINSTRUCTIONS (follow these exactly):\n{system_prompt}\n\n"
-                f"REMINDER: Output ONLY a valid JSON array. No text before or after."
-            )
-        else:
-            combined = (
-                f"INSTRUCTIONS (follow these exactly):\n{system_prompt}\n\n"
-                f"---\nINPUT:\n{user_prompt}"
-            )
+        combined = (
+            f"INSTRUCTIONS (follow these exactly):\n{system_prompt}\n\n"
+            f"---\nINPUT:\n{user_prompt}"
+        )
 
         form_data = {
             "model": self._model_id,
@@ -305,10 +292,7 @@ class _SubAgent:
                 {"role": "user", "content": combined},
             ],
             "stream": False,
-            "metadata": {
-                "task": "deep_research_sub_agent",
-                **({"features": {"web_search": True}} if enable_web_search else {}),
-            },
+            "metadata": {"task": "deep_research_sub_agent"},
         }
         response = await generate_chat_completion(
             request=request, form_data=form_data,
@@ -316,10 +300,10 @@ class _SubAgent:
         )
         return response["choices"][0]["message"]["content"]
 
-    async def run_json(self, system_prompt: str, user_prompt: str, request, user: Dict,
-                       enable_web_search: bool = False) -> Any:
+    async def run_json(self, system_prompt: str, user_prompt: str, request, user: Dict) -> Any:
+        """Call LLM and parse response as JSON."""
         raw = await self.run(system_prompt, user_prompt, request, user,
-                             enable_web_search, json_mode=True)
+                             json_mode=True)
         try:
             return _parse_json(raw)
         except ValueError:
@@ -394,14 +378,51 @@ class _Discovery:
         self._sa = sub_agent
 
     async def discover_domains(self, query: str, request, user: Dict) -> List[DiscoveredDomain]:
+        """Discover domains via direct web search + LLM ranking."""
+        from open_webui.routers.retrieval import search_web
+        from starlette.concurrency import run_in_threadpool
+
+        engine = getattr(request.app.state.config, "WEB_SEARCH_ENGINE", "")
+        if not engine:
+            logger.warning("No WEB_SEARCH_ENGINE configured — skipping domain discovery")
+            return []
+
+        try:
+            results = await run_in_threadpool(
+                search_web, request, engine,
+                f"authoritative documentation for {query}")
+        except Exception as e:
+            logger.error("Domain discovery search failed: %s", e)
+            return []
+
+        if not results:
+            return []
+
+        # Format search results for LLM ranking
+        listing = "\n".join(
+            f"- {r.link} | {r.title or '(no title)'} | {r.snippet or '(no snippet)'}"
+            for r in results[:20])
+
         try:
             data = await self._sa.run_json(
                 _DISCOVERY_PROMPT.format(max_domains=self._v.max_domains),
-                f"Find authoritative web sources for researching: {query}",
-                request, user, enable_web_search=True)
+                f"Research query: {query}\n\nWeb search results:\n{listing}",
+                request, user)
         except Exception as e:
-            logger.error("Domain discovery failed: %s", e)
-            return []
+            logger.error("Domain discovery LLM ranking failed: %s", e)
+            # Fall back to raw search results as domains
+            data = []
+            seen = set()
+            for r in results[:self._v.max_domains]:
+                try:
+                    domain = urlparse(r.link).netloc
+                except Exception:
+                    continue
+                if domain not in seen:
+                    seen.add(domain)
+                    data.append({
+                        "url": r.link, "domain": domain,
+                        "score": 0.5, "rationale": r.snippet or ""})
         return self._parse(data)
 
     async def rank_collections(self, query: str, collections: List[Dict], request, user: Dict) -> List[str]:
@@ -727,41 +748,26 @@ class _Synthesizer:
 #  Quick Research (web-search only)
 # =============================================================================
 
-_WEB_SEARCH_PROMPT = """\
-You have web search results for the user's query. Reformat ALL search \
-results into a JSON array.
-
-Rules:
-- Include EVERY result the search returned \u2014 do not filter or skip any.
-- For each result, extract: url, domain, title, summary (2-3 sentences), \
-relevance (0.0-1.0 vs the RESEARCH ANCHOR below).
-- Prefer diverse sources: include results from different organizations, \
-academic papers, independent blogs, and contrasting viewpoints \u2014 not just \
-the company or person mentioned in the query.
-
-RESEARCH ANCHOR (for relevance scoring only):
-{anchor}
-
-Return JSON array: [{{"url":"...","domain":"...","title":"...","summary":"2-3 sentences","relevance":0.0-1.0}}]
-Return at most {max_results} results. Respond ONLY with valid JSON, no commentary.\
-"""
+# _WEB_SEARCH_PROMPT removed — search results now come directly from search_web()
 
 _RELEVANCE_GATE_PROMPT = """\
 You are a strict relevance judge. Given a RESEARCH ANCHOR and a list of \
 web search results, judge each result.
 
 For EACH result, decide:
-- "relevant": directly addresses one or more key concepts / must_cover items from the anchor
-- "trail": partially related \u2014 it may not answer the query directly but \
-could lead to deeper sources. Also use "trail" for contrasting viewpoints \
-or alternative approaches that are still within the anchor's domain.
-- "drop": completely off-topic, about a different subject, or too vague
+- "relevant": addresses the anchor's topic area, key concepts, or must_cover \
+items — even if only partially. A page title or snippet that mentions the \
+core subject IS relevant. Err on the side of inclusion.
+- "trail": tangentially related — about the broader field but not the \
+specific topic. Also use for contrasting viewpoints or adjacent tools.
+- "drop": completely off-topic, about a different subject entirely.
 
 Return JSON array in the same order as the input:
 [{{"index": 0, "verdict": "relevant"|"trail"|"drop", "reason": "one sentence"}}]
 
-Be strict for "relevant" but generous for "trail" \u2014 contrasting or \
-competing perspectives within the domain are valuable trail sources.
+IMPORTANT: You are judging based on short search snippets, not full articles. \
+Be generous — if the title or snippet plausibly relates to the anchor, mark it \
+"relevant". Only "drop" truly unrelated results.
 Respond ONLY with valid JSON.\
 """
 
@@ -895,10 +901,22 @@ class _QuickResearcher:
                 search_terms = deeper + adjacent  # dive deeper
                 await _emit(emitter, f"\U0001f3af Iter {n}: +{len(rel)} relevant ({rel_count} total), +{len(trail)} trail \u2014 diving deeper")
             else:
-                consecutive_misses += 1
-                summary = f"No relevant hits (kept {len(trail)} trail, dropped {dropped}). Pivoting."
-                search_terms = await self._pivot(session, tried_terms, request, user)
-                await _emit(emitter, f"\U0001f504 Iter {n}: 0 relevant, {len(trail)} trail \u2014 pivoting ({consecutive_misses})")
+                # Trail sources indicate on-topic results — only a full miss
+                # when we get zero trail AND zero relevant
+                if trail:
+                    consecutive_misses = max(0, consecutive_misses)  # don't increment
+                    summary = f"No direct hits but {len(trail)} trail, dropped {dropped}. Refining."
+                    # Use trail content to inform next search instead of hard pivot
+                    extraction = await self._extract_topics(session, [], trail, request, user)
+                    search_terms = extraction.get("deeper_terms", []) + extraction.get("adjacent_leads", [])
+                    if not search_terms:
+                        search_terms = await self._pivot(session, tried_terms, request, user)
+                    await _emit(emitter, f"\U0001f504 Iter {n}: 0 relevant, {len(trail)} trail \u2014 refining")
+                else:
+                    consecutive_misses += 1
+                    summary = f"No results relevant to anchor. Pivoting (miss {consecutive_misses})."
+                    search_terms = await self._pivot(session, tried_terms, request, user)
+                    await _emit(emitter, f"\U0001f504 Iter {n}: 0 results \u2014 pivoting ({consecutive_misses})")
 
             it = IterationResult(n, new_terms, ["web_search"], len(raw), len(all_kept), summary, [])
             session.iterations.append(it)
@@ -933,15 +951,37 @@ class _QuickResearcher:
     # --- Search helpers ---
 
     async def _web_search(self, session, query, request, user):
-        # CRITICAL: anchor goes in system prompt (guides LLM formatting),
-        # search query goes in user prompt ALONE (guides OWUI's web search).
-        system = _WEB_SEARCH_PROMPT.format(
-            max_results=self._v.max_web_results, anchor=session.anchor)
-        try:
-            return await self._sa.run_json(system, query, request, user, enable_web_search=True)
-        except Exception as e:
-            logger.warning("Web search parse failed for query '%s': %s", query[:80], e)
+        """Call OWUI's search_web() directly — bypasses the LLM entirely."""
+        from open_webui.routers.retrieval import search_web
+        from starlette.concurrency import run_in_threadpool
+
+        engine = getattr(request.app.state.config, "WEB_SEARCH_ENGINE", "")
+        if not engine:
+            logger.warning("No WEB_SEARCH_ENGINE configured in OWUI admin settings")
             return []
+
+        try:
+            results = await run_in_threadpool(search_web, request, engine, query)
+        except Exception as e:
+            logger.warning("search_web failed for '%s': %s", query[:80], e)
+            return []
+
+        parsed = []
+        for r in results[:self._v.max_web_results]:
+            domain = ""
+            try:
+                domain = urlparse(r.link).netloc
+            except Exception:
+                pass
+            parsed.append({
+                "url": r.link,
+                "title": r.title or "",
+                "summary": r.snippet or "",
+                "domain": domain,
+            })
+
+        logger.info("Direct web search for '%s': %d results", query[:60], len(parsed))
+        return parsed
 
     # --- Relevance gate: returns (relevant, trail, drop_count) ---
 

@@ -61,14 +61,32 @@ class DomainDiscovery:
     ) -> List[DiscoveredDomain]:
         """Search the web for domains relevant to the research query.
 
-        Args:
-            query: The research question or topic.
-            request: OWUI __request__ object.
-            user: OWUI __user__ dict.
-
-        Returns:
-            List of DiscoveredDomain objects ranked by relevance score.
+        Calls OWUI's search_web() directly, then uses LLM to rank/score.
         """
+        from open_webui.routers.retrieval import search_web
+        from starlette.concurrency import run_in_threadpool
+
+        engine = getattr(request.app.state.config, "WEB_SEARCH_ENGINE", "")
+        if not engine:
+            logger.warning("No WEB_SEARCH_ENGINE configured — skipping domain discovery")
+            return []
+
+        try:
+            results = await run_in_threadpool(
+                search_web, request, engine,
+                f"authoritative documentation for {query}")
+        except Exception as e:
+            logger.error("Domain discovery search failed: %s", e)
+            return []
+
+        if not results:
+            return []
+
+        # Format search results for LLM ranking
+        listing = "\n".join(
+            f"- {r.link} | {r.title or '(no title)'} | {r.snippet or '(no snippet)'}"
+            for r in results[:20])
+
         system_prompt = _DISCOVERY_SYSTEM_PROMPT.format(
             max_domains=self._valves.max_domains,
         )
@@ -76,16 +94,25 @@ class DomainDiscovery:
         try:
             result = await self._sub_agent.run_json(
                 system_prompt=system_prompt,
-                user_prompt=(
-                    f"Find authoritative web sources for researching: {query}"
-                ),
+                user_prompt=f"Research query: {query}\n\nWeb search results:\n{listing}",
                 request=request,
                 user=user,
-                enable_web_search=True,
             )
-        except (ValueError, Exception) as e:
-            logger.error("Domain discovery failed: %s", e)
-            return []
+        except Exception as e:
+            logger.error("Domain discovery LLM ranking failed: %s", e)
+            # Fall back to raw search results as domains
+            result = []
+            seen = set()
+            for r in results[:self._valves.max_domains]:
+                try:
+                    domain = urlparse(r.link).netloc
+                except Exception:
+                    continue
+                if domain not in seen:
+                    seen.add(domain)
+                    result.append({
+                        "url": r.link, "domain": domain,
+                        "score": 0.5, "rationale": r.snippet or ""})
 
         return self._parse_domains(result)
 
