@@ -109,6 +109,24 @@ Return JSON:
 "recommendation": "pass|revise|flag_for_user"}\
 """
 
+_REMEDIATION_SYSTEM_PROMPT = """\
+You are a factual accuracy editor. You will receive:
+1. A research synthesis (markdown)
+2. A list of verified issues found by a reviewer
+
+Your job: rewrite the synthesis with ALL fabricated or unsupported content \
+removed or corrected. Rules:
+- DELETE sentences/bullet-points that contain fabricated examples, names, or claims.
+- Do NOT replace removed content with new invented content.
+- If removing content leaves a section empty, replace it with: \
+"*[Removed: insufficient evidence]*"
+- If a claim was flagged as unsupported, add "[UNVERIFIED]" before it \
+rather than deleting, unless the claim is clearly fabricated.
+- Keep ALL content that was NOT flagged — do not rewrite or rephrase it.
+- Preserve the original markdown structure (headings, lists, formatting).
+- Return ONLY the corrected synthesis markdown. No commentary.\
+"""
+
 
 class Synthesizer:
     """Produces a chain-of-thought synthesis from accumulated research.
@@ -214,27 +232,48 @@ class Synthesizer:
             verification = await self._verify_synthesis(
                 answer, all_sources, session, request, user
             )
-            credibility = verification.get("overall_credibility", "unknown")
             issues = verification.get("issues", [])
-            critical_count = sum(
-                1 for i in issues
+            critical_issues = [
+                i for i in issues
                 if isinstance(i, dict) and i.get("severity") == "critical"
-            )
-            warning_count = sum(
-                1 for i in issues
+            ]
+            warning_issues = [
+                i for i in issues
                 if isinstance(i, dict) and i.get("severity") == "warning"
-            )
+            ]
 
-            if critical_count:
+            # Derive credibility from issues when LLM returns unknown/missing
+            credibility = verification.get("overall_credibility", "unknown")
+            if credibility in ("unknown", "", None):
+                credibility = self._derive_credibility(
+                    len(critical_issues), len(warning_issues), len(all_sources)
+                )
+                verification["overall_credibility"] = credibility
+
+            if critical_issues:
                 await self._emit(
                     event_emitter,
-                    f"🔴 Verification: {critical_count} critical issue(s), credibility={credibility}",
+                    f"🔴 Verification: {len(critical_issues)} critical issue(s), "
+                    f"credibility={credibility}",
                 )
-            elif warning_count:
+                for ci in critical_issues:
+                    detail = ci.get("detail", ci.get("type", "unknown issue"))
+                    await self._emit(
+                        event_emitter,
+                        f"   ⚠️ {detail[:200]}",
+                    )
+            elif warning_issues:
                 await self._emit(
                     event_emitter,
-                    f"🟡 Verification: {warning_count} warning(s), credibility={credibility}",
+                    f"🟡 Verification: {len(warning_issues)} warning(s), "
+                    f"credibility={credibility}",
                 )
+                for wi in warning_issues:
+                    detail = wi.get("detail", wi.get("type", "unknown"))
+                    await self._emit(
+                        event_emitter,
+                        f"   🟡 {detail[:200]}",
+                    )
             elif credibility in ("unknown", "very_low"):
                 await self._emit(
                     event_emitter,
@@ -251,7 +290,22 @@ class Synthesizer:
                 session, verification, scrub_report, all_sources
             )
 
-            # Step 3: Append credibility report
+            # Step 3: Remediate fabricated content if critical issues found
+            if critical_issues:
+                await self._emit(
+                    event_emitter,
+                    f"\U0001f9f9 Removing {len(critical_issues)} fabricated/unsupported claim(s) from synthesis...",
+                )
+                answer = await self._remediate_synthesis(
+                    answer, critical_issues + warning_issues,
+                    request, user,
+                )
+                await self._emit(
+                    event_emitter,
+                    "\u2705 Synthesis cleaned \u2014 fabricated content removed",
+                )
+
+            # Step 4: Append credibility report
             credibility_section = self._build_credibility_report(
                 verification, scrub_report, all_sources
             )
@@ -612,6 +666,64 @@ class Synthesizer:
             )
 
         return "".join(parts)
+
+    @staticmethod
+    def _derive_credibility(
+        critical_count: int,
+        warning_count: int,
+        source_count: int,
+    ) -> str:
+        """Compute credibility from issue counts when the LLM didn't provide one."""
+        if source_count == 0:
+            return "very_low"
+        if critical_count >= 2:
+            return "low"
+        if critical_count == 1:
+            return "low" if warning_count else "medium"
+        if warning_count >= 3:
+            return "medium"
+        if warning_count >= 1:
+            return "medium"
+        return "high" if source_count >= 3 else "medium"
+
+    async def _remediate_synthesis(
+        self,
+        synthesis: str,
+        issues: List[Dict],
+        request: Any,
+        user: Dict,
+    ) -> str:
+        """Rewrite synthesis to remove fabricated/unsupported content.
+
+        Uses the LLM to surgically remove flagged content while preserving
+        everything that was not flagged.
+        """
+        issue_list = "\n".join(
+            f"- [{i.get('severity', '?')}] {i.get('type', '?')}: "
+            f"{i.get('detail', '')} | Location: \"{i.get('location', '')[:150]}\""
+            for i in issues
+            if isinstance(i, dict)
+        )
+        user_prompt = (
+            f"# Issues Found by Reviewer\n\n{issue_list}\n\n"
+            f"# Synthesis to Clean\n\n{synthesis}"
+        )
+        try:
+            cleaned = await self._sub_agent.run(
+                system_prompt=_REMEDIATION_SYSTEM_PROMPT,
+                user_prompt=user_prompt,
+                request=request,
+                user=user,
+            )
+            if cleaned and len(cleaned) > 100:
+                return cleaned
+            logger.warning(
+                "Remediation returned too-short result, keeping original"
+            )
+            return synthesis
+        except Exception as e:
+            logger.warning("Remediation pass failed: %s", e)
+            return synthesis
 
     @staticmethod
     async def _emit(
