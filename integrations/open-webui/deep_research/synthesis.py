@@ -64,6 +64,8 @@ class Synthesizer:
         session: ResearchSession,
         request: Any,
         user: Dict,
+        relevant_sources: List[Dict] = None,
+        trail_sources: List[Dict] = None,
     ) -> str:
         """Produce a final synthesis from all research iterations.
 
@@ -98,6 +100,8 @@ class Synthesizer:
             session=session,
             prompt_content=prompt_content,
             iteration_summaries=iteration_summaries,
+            relevant_sources=relevant_sources or [],
+            trail_sources=trail_sources or [],
         )
 
         try:
@@ -126,6 +130,8 @@ class Synthesizer:
         session: 'ResearchSession',
         prompt_content: str,
         iteration_summaries: List[str],
+        relevant_sources: List[Dict] = None,
+        trail_sources: List[Dict] = None,
     ) -> str:
         """Construct the user prompt for synthesis.
 
@@ -133,6 +139,8 @@ class Synthesizer:
             session: The research session (for query and anchor).
             prompt_content: Content of 00-prompt.md.
             iteration_summaries: Content of each iteration file.
+            relevant_sources: List of relevant source dicts with url/title/summary/domain.
+            trail_sources: List of trail source dicts with url/title/summary/domain.
 
         Returns:
             Formatted prompt string.
@@ -148,13 +156,28 @@ class Synthesizer:
         for i, summary in enumerate(iteration_summaries, 1):
             parts.append(f"# Iteration {i} Findings\n\n{summary}\n")
 
+        # Include the actual source data so the LLM can cite real URLs
+        all_sources = (relevant_sources or []) + (trail_sources or [])
+        if all_sources:
+            parts.append("# Collected Sources\n")
+            parts.append(
+                "These are the actual web sources found during research. "
+                "Use these URLs in your Sources section.\n"
+            )
+            for i, s in enumerate(all_sources, 1):
+                parts.append(
+                    f"{i}. **{s.get('title', 'Untitled')}**\n"
+                    f"   - URL: {s.get('url', 'N/A')}\n"
+                    f"   - Domain: {s.get('domain', '')}\n"
+                    f"   - Summary: {s.get('summary', '')}\n"
+                )
+
         parts.append(
             "\n---\n\n"
-            "Based on all the evidence above, produce a comprehensive, "
-            "well-cited synthesis that addresses EVERY item in the Research "
-            "Anchor's 'must_cover' list.\n"
-            "IMPORTANT: In the Sources section, list ONLY URLs that appear "
-            "verbatim in the iteration data above. Do NOT fabricate or guess any URLs."
+            "Produce a comprehensive synthesis that addresses EVERY item in the "
+            "Research Anchor's 'must_cover' list.\n"
+            "IMPORTANT: In the Sources section, list ONLY URLs from the "
+            "'Collected Sources' section above. Do NOT fabricate or guess any URLs."
         )
 
         return "\n\n".join(parts)

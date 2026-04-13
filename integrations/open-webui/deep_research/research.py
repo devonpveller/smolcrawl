@@ -285,7 +285,11 @@ class QuickResearcher:
             f"\U0001f9e0 Synthesizing ({len(relevant_sources)} relevant "
             f"+ {len(trail_sources)} trail sources)...",
         )
-        answer = await self._synthesizer.synthesize(session, request, user)
+        answer = await self._synthesizer.synthesize(
+            session, request, user,
+            relevant_sources=relevant_sources,
+            trail_sources=trail_sources,
+        )
         session.phase = ResearchPhase.COMPLETE
         await self._emit_status(
             event_emitter, f"\U0001f4c1 Journal: research/{slug}/", done=True

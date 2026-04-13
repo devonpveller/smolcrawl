@@ -703,7 +703,9 @@ class _Synthesizer:
         self._sa = sub_agent
         self._j = journal
 
-    async def synthesize(self, session: ResearchSession, request, user: Dict) -> str:
+    async def synthesize(self, session: ResearchSession, request, user: Dict,
+                          relevant_sources: List[Dict] = None,
+                          trail_sources: List[Dict] = None) -> str:
         prompt_md = self._j.read_entry(session.session_dir, "00-prompt.md")
         iter_mds = []
         for it in session.iterations:
@@ -718,8 +720,23 @@ class _Synthesizer:
             parts.append(f"# Context\n\n{prompt_md}\n")
         for i, md in enumerate(iter_mds, 1):
             parts.append(f"# Iteration {i}\n\n{md}\n")
+
+        # Include the actual source data so the LLM can cite real URLs
+        all_sources = (relevant_sources or []) + (trail_sources or [])
+        if all_sources:
+            parts.append("# Collected Sources\n")
+            parts.append("These are the actual web sources found during research. "
+                         "Use these URLs in your Sources section.\n")
+            for i, s in enumerate(all_sources, 1):
+                parts.append(
+                    f"{i}. **{s.get('title', 'Untitled')}**\n"
+                    f"   - URL: {s.get('url', 'N/A')}\n"
+                    f"   - Domain: {s.get('domain', '')}\n"
+                    f"   - Summary: {s.get('summary', '')}\n"
+                )
+
         parts.append("\n---\nProduce a comprehensive synthesis that addresses EVERY item in the Research Anchor's 'must_cover' list.\n"
-                     "IMPORTANT: In the Sources section, list ONLY URLs that appear verbatim in the iteration data above. Do NOT fabricate or guess any URLs.")
+                     "IMPORTANT: In the Sources section, list ONLY URLs from the 'Collected Sources' section above. Do NOT fabricate or guess any URLs.")
 
         try:
             answer = await self._sa.run(_SYNTHESIS_PROMPT, "\n\n".join(parts), request, user)
@@ -951,7 +968,9 @@ class _QuickResearcher:
         # --- Synthesize ---
         session.phase = ResearchPhase.SYNTHESIZING
         await _emit(emitter, f"\U0001f9e0 Synthesizing ({len(relevant_sources)} relevant + {len(trail_sources)} trail sources)...")
-        answer = await self._synth.synthesize(session, request, user)
+        answer = await self._synth.synthesize(session, request, user,
+                                               relevant_sources=relevant_sources,
+                                               trail_sources=trail_sources)
         session.phase = ResearchPhase.COMPLETE
         await _emit(emitter, f"\U0001f4c1 Journal: research/{slug}/", done=True)
 
@@ -1064,7 +1083,7 @@ class _QuickResearcher:
             domain = s.get("domain", "unknown")
             with open(os.path.join(sdir, f"{prefix}{domain}-{i}.md"), "w", encoding="utf-8") as f:
                 f.write(f"# {s.get('title', domain)}\n\n[Source: {s.get('url', '')}]\n[Relevance: {s.get('relevance', 0.0)}]\n\n## Content\n\n{s.get('summary', '')}\n")
-        idx = ["# Sources\n"] + [f"{i}. **{s.get('title', '?')}** ({s.get('domain', '')}) \u2014 {s.get('relevance', 0):.2f}\n" for i, s in enumerate(sources, 1)]
+        idx = ["# Sources\n"] + [f"{i}. **{s.get('title', '?')}** ({s.get('domain', '')}) \u2014 [{s.get('url', '')}]({s.get('url', '')})\n   {s.get('summary', '')[:200]}\n" for i, s in enumerate(sources, 1)]
         self._j.write_entry(session.session_dir, f"sources-iter{iteration}.md", "\n".join(idx))
 
     # --- Final analysis ---
