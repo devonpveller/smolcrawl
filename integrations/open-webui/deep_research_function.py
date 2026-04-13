@@ -924,17 +924,29 @@ class _QuickResearcher:
 
             # --- Step 4: Check goal ---
             if rel_count >= target:
-                await _emit(emitter, f"\u2705 Target reached: {rel_count}/{target} relevant sources")
-                break
+                # Have enough sources, but check for gaps before stopping
+                analysis = await self._analyze(session, request, user)
+                gaps = analysis.get("gaps", [])
+                gap_terms = analysis.get("new_terms", [])
+                if gaps and gap_terms and n < self._v.max_iterations:
+                    # Gaps remain and we have iterations left — keep going
+                    search_terms = gap_terms
+                    await _emit(emitter, f"\u2705 {rel_count}/{target} sources but gaps remain: {', '.join(gaps[:2])} \u2014 continuing")
+                else:
+                    await _emit(emitter, f"\u2705 Target reached: {rel_count}/{target} relevant sources")
+                    if gaps:
+                        await _emit(emitter, f"\U0001f50d Remaining gaps: {', '.join(gaps[:3])}")
+                    break
 
             if consecutive_misses >= 3:
                 await _emit(emitter, f"\u26a0\ufe0f 3 consecutive misses \u2014 proceeding with {rel_count} relevant")
                 break
 
-        # --- Final analysis of everything we collected ---
-        analysis = await self._analyze(session, request, user)
-        if analysis.get("gaps"):
-            await _emit(emitter, f"\U0001f50d Remaining gaps: {', '.join(analysis['gaps'][:3])}")
+        # --- Final analysis (only if not already done in loop) ---
+        if not (rel_count >= target):
+            analysis = await self._analyze(session, request, user)
+            if analysis.get("gaps"):
+                await _emit(emitter, f"\U0001f50d Remaining gaps: {', '.join(analysis['gaps'][:3])}")
 
         # --- Synthesize ---
         session.phase = ResearchPhase.SYNTHESIZING

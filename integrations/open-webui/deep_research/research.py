@@ -238,11 +238,29 @@ class QuickResearcher:
 
             # --- Step 4: Check goal ---
             if rel_count >= target:
-                await self._emit_status(
-                    event_emitter,
-                    f"\u2705 Target reached: {rel_count}/{target} relevant sources",
-                )
-                break
+                # Have enough sources, but check for gaps before stopping
+                analysis = await self._analyze_sources(session, request, user)
+                gaps = analysis.get("gaps", [])
+                gap_terms = analysis.get("new_terms", [])
+                if gaps and gap_terms and n < self._valves.max_iterations:
+                    # Gaps remain and we have iterations left — keep going
+                    search_terms = gap_terms
+                    await self._emit_status(
+                        event_emitter,
+                        f"\u2705 {rel_count}/{target} sources but gaps remain: "
+                        f"{', '.join(gaps[:2])} \u2014 continuing",
+                    )
+                else:
+                    await self._emit_status(
+                        event_emitter,
+                        f"\u2705 Target reached: {rel_count}/{target} relevant sources",
+                    )
+                    if gaps:
+                        await self._emit_status(
+                            event_emitter,
+                            f"\U0001f50d Remaining gaps: {', '.join(gaps[:3])}",
+                        )
+                    break
 
             if consecutive_misses >= 3:
                 await self._emit_status(
@@ -251,13 +269,14 @@ class QuickResearcher:
                 )
                 break
 
-        # --- Final analysis ---
-        analysis = await self._analyze_sources(session, request, user)
-        if analysis.get("gaps"):
-            await self._emit_status(
-                event_emitter,
-                f"\U0001f50d Remaining gaps: {', '.join(analysis['gaps'][:3])}",
-            )
+        # --- Final analysis (only if not already done in loop) ---
+        if not (rel_count >= target):
+            analysis = await self._analyze_sources(session, request, user)
+            if analysis.get("gaps"):
+                await self._emit_status(
+                    event_emitter,
+                    f"\U0001f50d Remaining gaps: {', '.join(analysis['gaps'][:3])}",
+                )
 
         # --- Synthesize ---
         session.phase = ResearchPhase.SYNTHESIZING
