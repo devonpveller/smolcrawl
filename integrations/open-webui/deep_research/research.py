@@ -89,10 +89,19 @@ Analyze collected web sources against the RESEARCH ANCHOR.
 1. Summarize what the sources cover well.
 2. Identify which specific aspects of the anchor are NOT yet \
 addressed (gaps). Be precise \u2014 quote the anchor's must_cover items.
-3. Suggest search terms that would specifically fill those gaps.
+3. Assess source authority: note if ALL sources are from forums, blogs, \
+or user-generated content with NO official documentation or primary \
+project pages. If so, flag "missing_official_sources" as a gap.
+4. Suggest search terms that would specifically fill those gaps. If \
+official sources are missing, include terms like \
+"<project> official documentation" or "<project> getting started guide".
 
 Return JSON:
-{{"summary":"2-3 paragraphs","gaps":["specific unaddressed aspects"],"covered_aspects":["aspects well-covered"],"new_terms":["terms targeting the gaps"],"new_concepts":["concepts discovered"]}}\
+{{"summary":"2-3 paragraphs","gaps":["specific unaddressed aspects"],\
+"has_official_source":true|false,\
+"covered_aspects":["aspects well-covered"],\
+"new_terms":["terms targeting the gaps"],\
+"new_concepts":["concepts discovered"]}}\
 """
 
 
@@ -143,9 +152,10 @@ class QuickResearcher:
         await self._emit_status(event_emitter, "\U0001f4cb Research session started")
 
         # Extract anchor once -- threads through every subsequent prompt
-        session.anchor = await extract_anchor(
+        anchor_result = await extract_anchor(
             self._sub_agent, query, request, user
         )
+        session.anchor, initial_terms = anchor_result
         self._journal.write_anchor(session)
         await self._emit_status(event_emitter, "\U0001f3af Research anchor extracted")
 
@@ -153,10 +163,11 @@ class QuickResearcher:
         relevant_sources: List[Dict] = []
         trail_sources: List[Dict] = []
         seen_urls: set = set()
-        search_terms = [query]
+        search_terms = initial_terms  # Use anchor-generated diverse terms
         tried_terms: set = set()
         target = self._valves.min_relevant_sources
         consecutive_misses = 0
+        rel_count = 0
 
         for n in range(1, self._valves.max_iterations + 1):
             # --- Step 1: Web search ---
@@ -179,6 +190,12 @@ class QuickResearcher:
                 it = IterationResult(n, new_terms, ["web_search"], 0, 0, "No results returned.", [])
                 session.iterations.append(it)
                 self._journal.write_iteration(session, it)
+                if consecutive_misses >= 3:
+                    await self._emit_status(
+                        event_emitter,
+                        f"\u26a0\ufe0f {consecutive_misses} consecutive misses \u2014 proceeding with {rel_count} relevant",
+                    )
+                    break
                 await self._emit_status(
                     event_emitter, f"\U0001f504 Iter {n}: 0 results \u2014 pivoting"
                 )
@@ -251,13 +268,31 @@ class QuickResearcher:
                 analysis = await self._analyze_sources(session, request, user)
                 gaps = analysis.get("gaps", [])
                 gap_terms = analysis.get("new_terms", [])
-                if gaps and gap_terms and n < self._valves.max_iterations:
-                    # Gaps remain and we have iterations left — keep going
-                    search_terms = gap_terms
+                has_official = analysis.get("has_official_source", True)
+
+                # Continue if: explicit gaps with terms, OR no official source yet
+                should_continue = n < self._valves.max_iterations and (
+                    (gaps and gap_terms)
+                    or not has_official
+                )
+                if should_continue:
+                    if not has_official and gap_terms:
+                        # Prioritize official-source queries
+                        search_terms = gap_terms
+                    elif gap_terms:
+                        search_terms = gap_terms
+                    else:
+                        search_terms = await self._pivot(session, tried_terms, request, user)
+
+                    reason_parts = []
+                    if gaps:
+                        reason_parts.append(", ".join(gaps[:2]))
+                    if not has_official:
+                        reason_parts.append("no official documentation found")
                     await self._emit_status(
                         event_emitter,
                         f"\u2705 {rel_count}/{target} sources but gaps remain: "
-                        f"{', '.join(gaps[:2])} \u2014 continuing",
+                        f"{'; '.join(reason_parts)} \u2014 continuing",
                     )
                 else:
                     await self._emit_status(

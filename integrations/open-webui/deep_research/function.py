@@ -136,9 +136,10 @@ class Tools:
         )
 
         # Extract anchor once — threads through all subsequent prompts
-        session.anchor = await extract_anchor(
+        anchor_result = await extract_anchor(
             sub_agent, query, __request__, __user__ or {}
         )
+        session.anchor = anchor_result[0]  # (anchor_string, initial_search_terms)
         journal.write_anchor(session)
         await self._emit_status(
             __event_emitter__, "🎯 Research anchor extracted"

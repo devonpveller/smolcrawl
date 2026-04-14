@@ -234,19 +234,32 @@ Return JSON:
  "intent": "one sentence: what the user wants to learn or accomplish",
  "scope_in": ["topics that ARE in scope"],
  "scope_out": ["adjacent topics that are NOT being asked about"],
- "must_cover": ["terms/phrases from the query that MUST appear in results"]}
+ "must_cover": ["terms/phrases from the query that MUST appear in results"],
+ "initial_search_terms": ["3-5 diverse web search queries designed to find \
+authoritative sources. Include: (1) the raw query, (2) an official-docs query \
+like 'X official documentation' or 'X getting started', (3) a technical \
+definition query like 'what is X framework'. Optimize for search engines, \
+not conversational phrasing."]}
 
-Be precise — use the user's exact words. Do NOT generalize or broaden.\
+Be precise — use the user's exact words for key_concepts and must_cover. \
+For initial_search_terms, rewrite the query into effective web search phrases.\
 """
 
 
-async def _extract_anchor(sa: '_SubAgent', query: str, request, user: Dict) -> str:
-    """Run one LLM call to distil the query into a reusable anchor block."""
+async def _extract_anchor(sa: '_SubAgent', query: str, request, user: Dict) -> tuple:
+    """Run one LLM call to distil the query into a reusable anchor block.
+
+    Returns:
+        Tuple of (anchor_string, initial_search_terms).
+    """
     try:
         r = await sa.run_json(_ANCHOR_PROMPT, query, request, user)
     except Exception:
-        # Fallback: just wrap the raw query
-        return f"RESEARCH ANCHOR\nQuery: {query}\nKey concepts: (extraction failed — use query as-is)"
+        return (
+            f"RESEARCH ANCHOR\nQuery: {query}\n"
+            f"Key concepts: (extraction failed — use query as-is)",
+            [query],
+        )
     lines = ["RESEARCH ANCHOR", f"Query: {query}"]
     if r.get("key_concepts"):
         lines.append(f"Key concepts: {', '.join(r['key_concepts'])}")
@@ -258,7 +271,14 @@ async def _extract_anchor(sa: '_SubAgent', query: str, request, user: Dict) -> s
         lines.append(f"In scope: {', '.join(r['scope_in'])}")
     if r.get("scope_out"):
         lines.append(f"Out of scope: {', '.join(r['scope_out'])}")
-    return "\n".join(lines)
+
+    search_terms = r.get("initial_search_terms", [])
+    if not search_terms:
+        search_terms = [query]
+    if query not in search_terms:
+        search_terms.insert(0, query)
+
+    return "\n".join(lines), search_terms
 
 
 # _WEB_SEARCH_LIST_PROMPT removed — we now call search_web() directly
@@ -1163,10 +1183,19 @@ Analyze collected web sources against the RESEARCH ANCHOR.
 1. Summarize what the sources cover well.
 2. Identify which specific aspects of the anchor are NOT yet \
 addressed (gaps). Be precise \u2014 quote the anchor's must_cover items.
-3. Suggest search terms that would specifically fill those gaps.
+3. Assess source authority: note if ALL sources are from forums, blogs, \
+or user-generated content with NO official documentation or primary \
+project pages. If so, flag "missing_official_sources" as a gap.
+4. Suggest search terms that would specifically fill those gaps. If \
+official sources are missing, include terms like \
+"<project> official documentation" or "<project> getting started guide".
 
 Return JSON:
-{{"summary":"2-3 paragraphs","gaps":["specific unaddressed aspects"],"covered_aspects":["aspects well-covered"],"new_terms":["terms targeting the gaps"],"new_concepts":["concepts discovered"]}}\
+{{"summary":"2-3 paragraphs","gaps":["specific unaddressed aspects"],\
+"has_official_source":true|false,\
+"covered_aspects":["aspects well-covered"],\
+"new_terms":["terms targeting the gaps"],\
+"new_concepts":["concepts discovered"]}}\
 """
 
 
@@ -1196,7 +1225,8 @@ class _QuickResearcher:
         await _emit(emitter, "\U0001f4cb Research session started")
 
         # Extract anchor once -- threads through every subsequent prompt
-        session.anchor = await _extract_anchor(self._sa, query, request, user)
+        anchor_result = await _extract_anchor(self._sa, query, request, user)
+        session.anchor, initial_terms = anchor_result
         self._j.write_anchor(session)
         await _emit(emitter, "\U0001f3af Research anchor extracted")
 
@@ -1204,10 +1234,11 @@ class _QuickResearcher:
         relevant_sources: List[Dict] = []       # confirmed anchor-matching
         trail_sources: List[Dict] = []           # led us toward relevant hits
         seen_urls: set = set()
-        search_terms = [query]
+        search_terms = initial_terms  # Use anchor-generated diverse terms
         tried_terms: set = set()
         target = self._v.min_relevant_sources
         consecutive_misses = 0
+        rel_count = 0
 
         for n in range(1, self._v.max_iterations + 1):
             # --- Step 1: Web search ---
@@ -1217,7 +1248,11 @@ class _QuickResearcher:
                 break
             tried_terms.update(new_terms)
 
-            raw = await self._web_search(session, " OR ".join(f'"{t}"' for t in new_terms) if len(new_terms) > 1 else new_terms[0], request, user)
+            # Search each term individually — OR-joining fails on most engines
+            raw = []
+            for term in new_terms[:3]:  # cap at 3 searches per iteration
+                hits = await self._web_search(session, term, request, user)
+                raw.extend(hits)
             raw = [r for r in raw if r.get("url", "") not in seen_urls]
             seen_urls.update(r.get("url", "") for r in raw)
 
@@ -1226,6 +1261,9 @@ class _QuickResearcher:
                 it = IterationResult(n, new_terms, ["web_search"], 0, 0, "No results returned.", [])
                 session.iterations.append(it)
                 self._j.write_iteration(session, it)
+                if consecutive_misses >= 3:
+                    await _emit(emitter, f"\u26a0\ufe0f {consecutive_misses} consecutive misses \u2014 proceeding with {rel_count} relevant")
+                    break
                 await _emit(emitter, f"\U0001f504 Iter {n}: 0 results \u2014 pivoting")
                 search_terms = await self._pivot(session, tried_terms, request, user)
                 continue
@@ -1281,10 +1319,26 @@ class _QuickResearcher:
                 analysis = await self._analyze(session, request, user)
                 gaps = analysis.get("gaps", [])
                 gap_terms = analysis.get("new_terms", [])
-                if gaps and gap_terms and n < self._v.max_iterations:
-                    # Gaps remain and we have iterations left — keep going
-                    search_terms = gap_terms
-                    await _emit(emitter, f"\u2705 {rel_count}/{target} sources but gaps remain: {', '.join(gaps[:2])} \u2014 continuing")
+                has_official = analysis.get("has_official_source", True)
+
+                # Continue if: explicit gaps with terms, OR no official source yet
+                should_continue = n < self._v.max_iterations and (
+                    (gaps and gap_terms) or not has_official
+                )
+                if should_continue:
+                    if not has_official and gap_terms:
+                        search_terms = gap_terms
+                    elif gap_terms:
+                        search_terms = gap_terms
+                    else:
+                        search_terms = await self._pivot(session, tried_terms, request, user)
+
+                    reason_parts = []
+                    if gaps:
+                        reason_parts.append(", ".join(gaps[:2]))
+                    if not has_official:
+                        reason_parts.append("no official documentation found")
+                    await _emit(emitter, f"\u2705 {rel_count}/{target} sources but gaps remain: {'; '.join(reason_parts)} \u2014 continuing")
                 else:
                     await _emit(emitter, f"\u2705 Target reached: {rel_count}/{target} relevant sources")
                     if gaps:
@@ -1540,7 +1594,8 @@ class Tools:
         await _emit(__event_emitter__, "📋 Deep research started")
 
         # Extract anchor once — threads through all subsequent prompts
-        session.anchor = await _extract_anchor(sa, query, __request__, __user__ or {})
+        anchor_result = await _extract_anchor(sa, query, __request__, __user__ or {})
+        session.anchor = anchor_result[0]  # (anchor_string, initial_search_terms)
         j.write_anchor(session)
         await _emit(__event_emitter__, "🎯 Research anchor extracted")
 

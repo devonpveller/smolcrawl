@@ -179,13 +179,19 @@ Return JSON:
  "intent": "one sentence: what the user wants to learn or accomplish",
  "scope_in": ["topics that ARE in scope"],
  "scope_out": ["adjacent topics that are NOT being asked about"],
- "must_cover": ["terms/phrases from the query that MUST appear in results"]}
+ "must_cover": ["terms/phrases from the query that MUST appear in results"],
+ "initial_search_terms": ["3-5 diverse web search queries designed to find \
+authoritative sources. Include: (1) the raw query, (2) an official-docs query \
+like 'X official documentation' or 'X getting started', (3) a technical \
+definition query like 'what is X framework'. Optimize for search engines, \
+not conversational phrasing."]}
 
-Be precise — use the user's exact words. Do NOT generalize or broaden.\
+Be precise — use the user's exact words for key_concepts and must_cover. \
+For initial_search_terms, rewrite the query into effective web search phrases.\
 """
 
 
-async def extract_anchor(sa: SubAgent, query: str, request: Any, user: Dict) -> str:
+async def extract_anchor(sa: SubAgent, query: str, request: Any, user: Dict) -> tuple:
     """Run one LLM call to distil the query into a reusable anchor block.
 
     Args:
@@ -195,12 +201,18 @@ async def extract_anchor(sa: SubAgent, query: str, request: Any, user: Dict) -> 
         user: OWUI __user__ dict.
 
     Returns:
-        Multi-line anchor string to prepend to every prompt.
+        Tuple of (anchor_string, initial_search_terms).
+        anchor_string: Multi-line anchor to prepend to every prompt.
+        initial_search_terms: List of diverse search queries for iteration 1.
     """
     try:
         r = await sa.run_json(_ANCHOR_PROMPT, query, request, user)
     except Exception:
-        return f"RESEARCH ANCHOR\nQuery: {query}\nKey concepts: (extraction failed \u2014 use query as-is)"
+        return (
+            f"RESEARCH ANCHOR\nQuery: {query}\n"
+            f"Key concepts: (extraction failed \u2014 use query as-is)",
+            [query],
+        )
     lines = ["RESEARCH ANCHOR", f"Query: {query}"]
     if r.get("key_concepts"):
         lines.append(f"Key concepts: {', '.join(r['key_concepts'])}")
@@ -212,4 +224,12 @@ async def extract_anchor(sa: SubAgent, query: str, request: Any, user: Dict) -> 
         lines.append(f"In scope: {', '.join(r['scope_in'])}")
     if r.get("scope_out"):
         lines.append(f"Out of scope: {', '.join(r['scope_out'])}")
-    return "\n".join(lines)
+
+    search_terms = r.get("initial_search_terms", [])
+    if not search_terms:
+        search_terms = [query]
+    # Always include the raw query as a fallback
+    if query not in search_terms:
+        search_terms.insert(0, query)
+
+    return "\n".join(lines), search_terms
