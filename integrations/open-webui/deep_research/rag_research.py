@@ -82,6 +82,7 @@ class RagResearcher:
         collection_id: str,
         query: str,
         collection_name: str = "",
+        k_override: Optional[int] = None,
     ) -> List[RetrievedChunk]:
         """Query a single knowledge collection via OWUI's retrieval API.
 
@@ -89,10 +90,13 @@ class RagResearcher:
             collection_id: UUID of the collection to search.
             query: Natural language query string.
             collection_name: Human-readable name for logging.
+            k_override: Override the default top-k value. When None,
+                uses ``valves.top_k_per_collection``.
 
         Returns:
             List of RetrievedChunk objects.
         """
+        effective_k = k_override if k_override is not None else self._valves.top_k_per_collection
         try:
             async with httpx.AsyncClient(timeout=30.0) as client:
                 response = await client.post(
@@ -104,7 +108,7 @@ class RagResearcher:
                     json={
                         "collection_name": collection_id,
                         "query": query,
-                        "k": self._valves.top_k_per_collection,
+                        "k": effective_k,
                         "r": 0.0,
                     },
                 )
@@ -130,6 +134,7 @@ class RagResearcher:
         iteration_number: int,
         request: Any,
         user: Dict,
+        k_override: Optional[int] = None,
     ) -> IterationResult:
         """Execute a single research iteration: query + summarize.
 
@@ -155,6 +160,7 @@ class RagResearcher:
                     collection_id=col_id,
                     query=term,
                     collection_name=collection_names.get(col_id, col_id),
+                    k_override=k_override,
                 )
                 for chunk in chunks:
                     all_chunks.append(chunk)

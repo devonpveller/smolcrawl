@@ -90,6 +90,7 @@ class Tools:
     async def knowledge_research(
         self,
         query: str,
+        collection: str = "",
         __user__: dict = None,
         __metadata__: dict = None,
         __event_emitter__=None,
@@ -111,6 +112,9 @@ class Tools:
 
         Args:
             query: The research question or topic to investigate.
+            collection: Optional name of a specific knowledge collection
+                to query. When provided, skips auto-detection and uses
+                this collection exclusively.
         """
         model_id = SubAgent.resolve_model_id(__metadata__, __model__)
         user_id = (__user__ or {}).get("id", "")
@@ -126,6 +130,7 @@ class Tools:
             user=__user__ or {},
             model_id=model_id,
             event_emitter=__event_emitter__,
+            target_collection=collection,
         )
 
     async def deep_research(

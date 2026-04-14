@@ -626,12 +626,13 @@ class _RagResearcher:
             logger.error("Failed to list collections: %s", e)
             return []
 
-    async def query_collection(self, col_id: str, query: str, col_name: str = "") -> List[RetrievedChunk]:
+    async def query_collection(self, col_id: str, query: str, col_name: str = "", k_override: int = None) -> List[RetrievedChunk]:
+        effective_k = k_override if k_override is not None else self._v.top_k_per_collection
         try:
             async with httpx.AsyncClient(timeout=30.0) as client:
                 resp = await client.post(f"{self._v.owui_base_url}/api/v1/retrieval/query",
                     headers={"Authorization": f"Bearer {self._v.owui_api_key}", "Content-Type": "application/json"},
-                    json={"collection_name": col_id, "query": query, "k": self._v.top_k_per_collection, "r": 0.0})
+                    json={"collection_name": col_id, "query": query, "k": effective_k, "r": 0.0})
                 resp.raise_for_status()
                 return self._parse_retrieval(resp.json(), col_id, col_name)
         except Exception as e:
@@ -640,11 +641,12 @@ class _RagResearcher:
 
     async def run_iteration(self, session: ResearchSession, terms: List[str],
                             col_ids: List[str], col_names: Dict[str, str],
-                            iter_num: int, request, user: Dict) -> IterationResult:
+                            iter_num: int, request, user: Dict,
+                            k_override: int = None) -> IterationResult:
         all_chunks, new_chunks = [], []
         for term in terms:
             for cid in col_ids:
-                for chunk in await self.query_collection(cid, term, col_names.get(cid, cid)):
+                for chunk in await self.query_collection(cid, term, col_names.get(cid, cid), k_override=k_override):
                     all_chunks.append(chunk)
                     if session.add_seen_chunk(cid, chunk.chunk_hash):
                         new_chunks.append(chunk)
@@ -1571,6 +1573,8 @@ class _KnowledgeResearcher:
     """Iterative RAG-only research across existing OWUI knowledge collections."""
 
     _MAX_STALE = 3
+    _SMALL_FILE_THRESHOLD = 5
+    _SMALL_K_MULTIPLIER = 3
 
     def __init__(self, valves, sa: _SubAgent, j: _Journal, synth: _Synthesizer):
         self._v = valves
@@ -1579,7 +1583,7 @@ class _KnowledgeResearcher:
         self._synth = synth
         self._rag = _RagResearcher(valves, sa)
 
-    async def run(self, query: str, user_id: str, request, user: Dict, model_id: str, emitter=None) -> str:
+    async def run(self, query: str, user_id: str, request, user: Dict, model_id: str, emitter=None, target_collection: str = "") -> str:
         slug = _Journal.slugify(query)
         sdir = self._j.resolve_session_dir(user_id, slug, namespace="knowledge-research")
         session = ResearchSession(session_id=f"kr-{slug}", query=query, session_dir=sdir, model_id=model_id)
@@ -1606,7 +1610,27 @@ class _KnowledgeResearcher:
             await _emit(emitter, f"📁 Journal: knowledge-research/{slug}/", done=True)
             return answer
 
-        relevant = await self._rank_collections(session, all_cols, request, user)
+        # User-specified collection or LLM-ranked selection
+        if target_collection:
+            relevant = self._find_collection_by_name(target_collection, all_cols)
+            if not relevant:
+                available = ", ".join(f"'{c['name']}'" for c in all_cols[:15])
+                await _emit(emitter, f"⚠️ Collection '{target_collection}' not found")
+                session.phase = ResearchPhase.COMPLETE
+                answer = (
+                    f"# Collection Not Found\n\n"
+                    f"No collection matching **{target_collection}** was found.\n\n"
+                    f"**Available collections:** {available}\n\n"
+                    f"*Specify one of the above names, or omit the "
+                    f"collection parameter to auto-select.*\n"
+                )
+                self._j.write_entry(session.session_dir, "synthesis.md", answer)
+                self._j.write_manifest(session)
+                await _emit(emitter, f"📁 Journal: knowledge-research/{slug}/", done=True)
+                return answer
+            await _emit(emitter, f"📌 Using specified collection: {relevant[0]['name']}")
+        else:
+            relevant = await self._rank_collections(session, all_cols, request, user)
 
         if not relevant:
             await _emit(emitter, "⚠️ No relevant collections identified — searching for source recommendations")
@@ -1622,9 +1646,18 @@ class _KnowledgeResearcher:
         col_map = {r["id"]: r["name"] for r in relevant}
         session.relevant_collection_ids = col_ids
 
+        # Compute adaptive k based on collection sizes
+        effective_k = self._compute_adaptive_k(relevant)
+
         self._j.write_entry(session.session_dir, "01-collections.md",
                             self._fmt_collections(relevant, all_cols))
-        await _emit(emitter, f"📚 {len(relevant)}/{len(all_cols)} collection(s) selected")
+        total_files = sum(len(c.get("data", {}).get("file_ids", [])) for c in relevant)
+        k_label = (
+            f"deep retrieval (k={effective_k})"
+            if effective_k > self._v.top_k_per_collection
+            else f"standard RAG (k={effective_k})"
+        )
+        await _emit(emitter, f"📚 {len(relevant)}/{len(all_cols)} collection(s) selected ({total_files} files) — {k_label}")
 
         # --- Step 3: Iterative RAG ---
         session.phase = ResearchPhase.RESEARCHING
@@ -1633,7 +1666,7 @@ class _KnowledgeResearcher:
 
         for n in range(1, self._v.max_iterations + 1):
             await _emit(emitter, f"🔍 Iteration {n}: querying {len(col_ids)} collection(s)...")
-            it = await self._rag.run_iteration(session, terms, col_ids, col_map, n, request, user)
+            it = await self._rag.run_iteration(session, terms, col_ids, col_map, n, request, user, k_override=effective_k)
             self._j.write_iteration(session, it)
 
             if it.new_chunks == 0:
@@ -1680,11 +1713,12 @@ class _KnowledgeResearcher:
                                     self._fmt_recs_journal(recs))
                 await _emit(emitter, f"📡 Found {rc} source recommendation(s)")
 
-        # --- Step 6: Synthesis ---
+        # --- Step 6: Synthesis + Validation ---
         session.phase = ResearchPhase.SYNTHESIZING
         await _emit(emitter, "🧠 Synthesizing findings...")
 
         rag_sources = self._build_rag_sources(session, col_map)
+        await _emit(emitter, "🔒 Starting validation pipeline (URL check → credibility → remediation)...")
         answer = await self._synth.synthesize(session, request, user,
                                                relevant_sources=rag_sources,
                                                event_emitter=emitter)
@@ -1695,6 +1729,26 @@ class _KnowledgeResearcher:
         self._j.write_manifest(session)
         await _emit(emitter, f"📁 Journal: knowledge-research/{slug}/", done=True)
         return answer
+
+    # --- Collection selection helpers ---
+
+    @staticmethod
+    def _find_collection_by_name(name, collections):
+        target = name.strip().lower()
+        for c in collections:
+            if c.get("name", "").strip().lower() == target:
+                col = c.copy()
+                col["_relevance"] = "high"
+                col["_rationale"] = "User-specified collection"
+                return [col]
+        return []
+
+    def _compute_adaptive_k(self, collections):
+        total_files = sum(len(c.get("data", {}).get("file_ids", [])) for c in collections)
+        base_k = self._v.top_k_per_collection
+        if total_files <= self._SMALL_FILE_THRESHOLD:
+            return base_k * self._SMALL_K_MULTIPLIER
+        return base_k
 
     # --- Collection ranking ---
 
@@ -1927,7 +1981,7 @@ class Tools:
             query, (__user__ or {}).get("id", ""), __request__, __user__ or {}, mid, __event_emitter__)
 
     async def knowledge_research(
-        self, query: str,
+        self, query: str, collection: str = "",
         __user__: dict = None, __metadata__: dict = None, __event_emitter__=None,
         __request__=None, __model__: dict = None, __event_call__=None,
         __chat_id__: str = "", __message_id__: str = "",
@@ -1944,13 +1998,17 @@ class Tools:
 
         Args:
             query: The research question or topic to investigate.
+            collection: Optional name of a specific knowledge collection
+                to query. When provided, skips auto-detection and uses
+                this collection exclusively.
         """
         mid = _SubAgent.resolve_model_id(__metadata__, __model__)
         sa = _SubAgent(mid)
         j = _Journal(self.valves)
         syn = _Synthesizer(self.valves, sa, j)
         return await _KnowledgeResearcher(self.valves, sa, j, syn).run(
-            query, (__user__ or {}).get("id", ""), __request__, __user__ or {}, mid, __event_emitter__)
+            query, (__user__ or {}).get("id", ""), __request__, __user__ or {}, mid, __event_emitter__,
+            target_collection=collection)
 
     async def deep_research(
         self, query: str,

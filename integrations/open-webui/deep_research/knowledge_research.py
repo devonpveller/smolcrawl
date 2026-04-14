@@ -112,6 +112,8 @@ class KnowledgeResearcher:
     """
 
     MAX_STALE_ITERATIONS = 3
+    SMALL_COLLECTION_FILE_THRESHOLD = 5
+    SMALL_COLLECTION_K_MULTIPLIER = 3
 
     def __init__(
         self,
@@ -133,6 +135,7 @@ class KnowledgeResearcher:
         user: Dict,
         model_id: str,
         event_emitter: Optional[Callable] = None,
+        target_collection: str = "",
     ) -> str:
         """Execute knowledge research pipeline.
 
@@ -143,6 +146,9 @@ class KnowledgeResearcher:
             user: OWUI __user__ dict.
             model_id: The active LLM model ID.
             event_emitter: OWUI event emitter for status updates.
+            target_collection: Optional collection name to query directly.
+                When specified, skips LLM-based collection ranking and
+                uses this collection exclusively.
 
         Returns:
             Synthesized answer with source references and recommendations.
@@ -194,9 +200,43 @@ class KnowledgeResearcher:
             )
             return answer
 
-        relevant = await self._rank_collections(
-            session, all_collections, request, user
-        )
+        # User-specified collection or LLM-ranked selection
+        if target_collection:
+            relevant = self._find_collection_by_name(
+                target_collection, all_collections
+            )
+            if not relevant:
+                available = ", ".join(
+                    f"'{c['name']}'" for c in all_collections[:15]
+                )
+                await self._emit(
+                    event_emitter,
+                    f"⚠️ Collection '{target_collection}' not found",
+                )
+                session.phase = ResearchPhase.COMPLETE
+                answer = (
+                    f"# Collection Not Found\n\n"
+                    f"No collection matching **{target_collection}** was found.\n\n"
+                    f"**Available collections:** {available}\n\n"
+                    f"*Specify one of the above names, or omit the "
+                    f"collection parameter to auto-select.*\n"
+                )
+                self._journal.write_synthesis(session, answer)
+                self._journal.write_manifest(session)
+                await self._emit(
+                    event_emitter,
+                    f"📁 Journal: knowledge-research/{slug}/",
+                    done=True,
+                )
+                return answer
+            await self._emit(
+                event_emitter,
+                f"📌 Using specified collection: {relevant[0]['name']}",
+            )
+        else:
+            relevant = await self._rank_collections(
+                session, all_collections, request, user
+            )
 
         if not relevant:
             await self._emit(
@@ -223,15 +263,28 @@ class KnowledgeResearcher:
         collection_map = {r["id"]: r["name"] for r in relevant}
         session.relevant_collection_ids = collection_ids
 
+        # Compute adaptive k based on collection sizes
+        effective_k = self._compute_adaptive_k(relevant)
+
         self._journal.write_entry(
             session.session_dir,
             "01-collections.md",
             self._format_collections_journal(relevant, all_collections),
         )
 
+        total_files = sum(
+            len(c.get("data", {}).get("file_ids", []))
+            for c in relevant
+        )
+        k_label = (
+            f"deep retrieval (k={effective_k})"
+            if effective_k > self._valves.top_k_per_collection
+            else f"standard RAG (k={effective_k})"
+        )
         await self._emit(
             event_emitter,
-            f"📚 {len(relevant)}/{len(all_collections)} collection(s) selected",
+            f"📚 {len(relevant)}/{len(all_collections)} collection(s) "
+            f"selected ({total_files} files) — {k_label}",
         )
 
         # --- Step 3: Iterative RAG ---
@@ -254,6 +307,7 @@ class KnowledgeResearcher:
                 iteration_number=iter_num,
                 request=request,
                 user=user,
+                k_override=effective_k,
             )
             self._journal.write_iteration(session, iteration)
 
@@ -348,13 +402,17 @@ class KnowledgeResearcher:
                     f"📡 Found {rec_count} source recommendation(s)",
                 )
 
-        # --- Step 6: Synthesis ---
+        # --- Step 6: Synthesis + Validation ---
         session.phase = ResearchPhase.SYNTHESIZING
         await self._emit(event_emitter, "🧠 Synthesizing findings...")
 
         # Build source entries from collections for the synthesizer
         rag_sources = self._build_rag_sources(session, collection_map)
 
+        await self._emit(
+            event_emitter,
+            "🔒 Starting validation pipeline (URL check → credibility → remediation)...",
+        )
         answer = await self._synthesizer.synthesize(
             session, request, user,
             relevant_sources=rag_sources,
@@ -375,6 +433,43 @@ class KnowledgeResearcher:
         )
 
         return answer
+
+    # ------------------------------------------------------------------
+    # Collection selection helpers
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _find_collection_by_name(
+        name: str,
+        collections: List[Dict],
+    ) -> List[Dict]:
+        """Find a collection by name (case-insensitive).
+
+        Returns a single-element list for consistency with _rank_collections.
+        """
+        target = name.strip().lower()
+        for c in collections:
+            if c.get("name", "").strip().lower() == target:
+                col = c.copy()
+                col["_relevance"] = "high"
+                col["_rationale"] = "User-specified collection"
+                return [col]
+        return []
+
+    def _compute_adaptive_k(self, collections: List[Dict]) -> int:
+        """Compute effective top-k based on total collection size.
+
+        Small collections (few files) get a higher k to retrieve more
+        of their content. Large collections use the configured default.
+        """
+        total_files = sum(
+            len(c.get("data", {}).get("file_ids", []))
+            for c in collections
+        )
+        base_k = self._valves.top_k_per_collection
+        if total_files <= self.SMALL_COLLECTION_FILE_THRESHOLD:
+            return base_k * self.SMALL_COLLECTION_K_MULTIPLIER
+        return base_k
 
     # ------------------------------------------------------------------
     # Collection ranking
