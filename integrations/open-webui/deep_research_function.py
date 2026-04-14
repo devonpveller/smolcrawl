@@ -1958,11 +1958,15 @@ class Tools:
         __request__=None, __model__: dict = None, __event_call__=None,
         __chat_id__: str = "", __message_id__: str = "",
     ) -> str:
-        """Deep research on a topic. Discovers relevant domains via web
-        search, crawls them into knowledge collections, runs iterative
-        RAG retrieval, and synthesizes a comprehensive answer.
+        """Deep research on a topic — the full hybrid pipeline.
 
-        The full pipeline runs automatically: discover → crawl → research → synthesize.
+        Starts by querying existing knowledge collections (knowledge_research).
+        If the knowledge base cannot answer the query, identifies sources via
+        web search (research), crawls them into new collections, then queries
+        the expanded knowledge base again before synthesising.
+
+        Pipeline: knowledge_research → gap analysis → web search →
+        crawl → knowledge_research → synthesize → verify.
 
         Args:
             query: The research question or topic to investigate.
@@ -1970,10 +1974,10 @@ class Tools:
         mid = _SubAgent.resolve_model_id(__metadata__, __model__)
         sa = _SubAgent(mid)
         j = _Journal(self.valves)
-        disc = _Discovery(self.valves, sa)
         rag = _RagResearcher(self.valves, sa)
         crawl = _CrawlClient(self.valves)
         synth = _Synthesizer(self.valves, sa, j)
+        kr = _KnowledgeResearcher(self.valves, sa, j, synth)
 
         slug = _Journal.slugify(query)
         sdir = j.resolve_session_dir((__user__ or {}).get("id", ""), slug)
@@ -1983,74 +1987,164 @@ class Tools:
 
         # Extract anchor once — threads through all subsequent prompts
         anchor_result = await _extract_anchor(sa, query, __request__, __user__ or {})
-        session.anchor = anchor_result[0]  # (anchor_string, initial_search_terms)
+        session.anchor, initial_terms = anchor_result
         j.write_anchor(session)
         await _emit(__event_emitter__, "🎯 Research anchor extracted")
 
-        # --- Phase 1: Discover domains and check existing collections ---
+        # =============================================================
+        #  Phase 1: Knowledge Research — query existing collections
+        # =============================================================
         session.phase = ResearchPhase.DISCOVERING
         all_cols = await rag.list_collections()
-        rel_ids = await disc.rank_collections(query, all_cols, __request__, __user__ or {})
-        session.relevant_collection_ids = rel_ids
-        rel_cols = [c for c in all_cols if c["id"] in rel_ids]
-        await _emit(__event_emitter__, f"📚 {len(all_cols)} collection(s), {len(rel_ids)} relevant")
+        relevant = await kr._rank_collections(session, all_cols, __request__, __user__ or {})
+        col_ids = [r["id"] for r in relevant]
+        col_map = {r["id"]: r["name"] for r in relevant}
+        session.relevant_collection_ids = list(col_ids)
+        await _emit(__event_emitter__, f"📚 {len(relevant)}/{len(all_cols)} collection(s) relevant")
 
-        domains = await disc.discover_domains(query, __request__, __user__ or {})
-        domains = disc.check_coverage(domains, all_cols)
-        session.discovered_domains = domains
-        j.write_domains(session, rel_cols)
+        has_existing = bool(col_ids)
+        stale = 0
+        terms = initial_terms
 
-        # --- Phase 2: Auto-approve and crawl new domains ---
-        approved = [d for d in domains if not d.already_covered]
-        if approved:
+        if has_existing:
+            session.phase = ResearchPhase.RESEARCHING
+            await _emit(__event_emitter__, "🔍 Phase 1: Querying existing knowledge...")
+            for n in range(1, self.valves.max_iterations + 1):
+                await _emit(__event_emitter__, f"🔍 KR iter {n}: querying {len(col_ids)} collection(s)...")
+                it = await rag.run_iteration(session, terms, col_ids, col_map, n, __request__, __user__ or {})
+                j.write_iteration(session, it)
+
+                if it.new_chunks == 0:
+                    stale += 1
+                else:
+                    stale = 0
+
+                stale_note = f" (stale: {stale}/3)" if stale > 0 else ""
+                await _emit(__event_emitter__, f"📚 KR iter {n}: {it.new_chunks} new chunk(s){stale_note}")
+
+                if stale >= 3:
+                    await _emit(__event_emitter__, "⚠️ Existing knowledge exhausted — analyzing gaps")
+                    break
+
+                terms = await rag.expand_terms(session, terms, __request__, __user__ or {})
+                if n >= self.valves.fixed_iterations:
+                    if n >= self.valves.max_iterations:
+                        break
+                    if not await rag.should_continue(session, __request__, __user__ or {}):
+                        await _emit(__event_emitter__, "✅ Phase 1 complete — checking for gaps")
+                        break
+
+        # =============================================================
+        #  Phase 2: Gap analysis — decide if we need external sources
+        # =============================================================
+        gap = await kr._analyze_gaps(session, __request__, __user__ or {})
+        gaps = gap.get("gaps", [])
+        exhausted = gap.get("exhausted", not has_existing)
+        external = gap.get("external_topics", [])
+
+        gf = len(session.iterations) + 3
+        j.write_entry(session.session_dir, f"{gf:02d}-gap-analysis.md", kr._fmt_gaps(gap))
+
+        needs_external = not has_existing or (gaps and (exhausted or stale >= 3))
+        if gaps:
+            await _emit(__event_emitter__, f"🔎 Gaps: {', '.join(gaps[:3])}" + (" — searching the web" if needs_external else ""))
+
+        # =============================================================
+        #  Phase 3: Web search → identify authoritative sources
+        # =============================================================
+        discovered = []
+        if needs_external:
+            await _emit(__event_emitter__, "🌐 Phase 2: Searching for authoritative sources...")
+            gap_terms = gap.get("gap_search_terms", []) or external or gaps or initial_terms
+            recs = await kr._recommend_sources(session, gaps, gap_terms, __request__, __user__ or {})
+            discovered = recs.get("recommendations", [])
+            if discovered:
+                j.write_entry(session.session_dir, f"{gf + 1:02d}-source-discovery.md", kr._fmt_recs_journal(recs))
+                await _emit(__event_emitter__, f"📡 Found {len(discovered)} source(s) to crawl")
+
+        # =============================================================
+        #  Phase 4: Crawl discovered sources into knowledge collections
+        # =============================================================
+        if discovered:
             session.phase = ResearchPhase.CRAWLING
-            names = ", ".join(d.domain for d in approved[:5])
-            await _emit(__event_emitter__, f"🕷️ Crawling {len(approved)} domain(s): {names}")
-            for d in approved:
-                kb = f"SmolCrawl - {d.domain}"
-                r = await crawl.trigger_crawl(d.domain, kb, __event_emitter__)
+            seen_d: set = set()
+            targets = []
+            for src in discovered:
+                d = src.get("domain", "")
+                if d and d not in seen_d:
+                    seen_d.add(d)
+                    targets.append(src)
+
+            names = ", ".join(s.get("domain", "") for s in targets[:5])
+            await _emit(__event_emitter__, f"🕷️ Crawling {len(targets)} domain(s): {names}")
+
+            for src in targets[:self.valves.max_domains]:
+                d = src.get("domain", "")
+                kb = f"SmolCrawl - {d}"
+                r = await crawl.trigger_crawl(d, kb, __event_emitter__)
                 session.crawl_results.append(r)
                 if r.success and r.kb_id:
                     session.relevant_collection_ids.append(r.kb_id)
+
             j.write_crawl_status(session)
             ok = sum(1 for r in session.crawl_results if r.success)
-            await _emit(__event_emitter__, f"✅ Crawled {ok}/{len(approved)} domain(s)")
-        else:
-            await _emit(__event_emitter__, "📚 All domains already in knowledge base")
+            await _emit(__event_emitter__, f"✅ Crawled {ok}/{len(targets)} domain(s)")
 
-        # Refresh collections after crawl to pick up new KB IDs
-        all_cols = await rag.list_collections()
-        col_map = {c["id"]: c["name"] for c in all_cols}
-        for cr in session.crawl_results:
-            if cr.success:
-                for c in all_cols:
-                    if c["name"] == cr.kb_name:
-                        if c["id"] not in session.relevant_collection_ids:
-                            session.relevant_collection_ids.append(c["id"])
-                        cr.kb_id = c["id"]
+            # Refresh collections
+            all_cols = await rag.list_collections()
+            col_map = {c["id"]: c["name"] for c in all_cols}
+            for cr in session.crawl_results:
+                if cr.success:
+                    for c in all_cols:
+                        if c["name"] == cr.kb_name:
+                            if c["id"] not in session.relevant_collection_ids:
+                                session.relevant_collection_ids.append(c["id"])
+                            cr.kb_id = c["id"]
+                            break
+
+        # =============================================================
+        #  Phase 5: Knowledge Research pass 2 — query expanded KBs
+        # =============================================================
+        new_ids = [cid for cid in session.relevant_collection_ids if cid not in col_ids]
+        if new_ids or (discovered and not has_existing):
+            session.phase = ResearchPhase.RESEARCHING
+            all_ids = session.relevant_collection_ids
+            await _emit(__event_emitter__, f"🔍 Phase 3: Querying {len(all_ids)} collection(s) (+{len(new_ids)} new)...")
+
+            p2_terms = initial_terms + gaps[:3]
+            p2_stale = 0
+            start = len(session.iterations) + 1
+
+            for n in range(start, start + self.valves.max_iterations):
+                await _emit(__event_emitter__, f"🔍 KR iter {n}: querying {len(all_ids)} collection(s)...")
+                it = await rag.run_iteration(session, p2_terms, all_ids, col_map, n, __request__, __user__ or {})
+                j.write_iteration(session, it)
+
+                if it.new_chunks == 0:
+                    p2_stale += 1
+                else:
+                    p2_stale = 0
+
+                await _emit(__event_emitter__, f"📚 KR iter {n}: {it.new_chunks} new chunk(s)")
+                if p2_stale >= 3:
+                    break
+
+                p2_terms = await rag.expand_terms(session, p2_terms, __request__, __user__ or {})
+                if (n - start + 1) >= self.valves.fixed_iterations:
+                    if not await rag.should_continue(session, __request__, __user__ or {}):
+                        await _emit(__event_emitter__, "✅ Phase 3 complete")
                         break
 
-        # --- Phase 3: Iterative RAG research ---
-        session.phase = ResearchPhase.RESEARCHING
-        terms = [session.query]
-        for n in range(1, self.valves.max_iterations + 1):
-            await _emit(__event_emitter__, f"🔍 Research iteration {n}...")
-            it = await rag.run_iteration(session, terms, session.relevant_collection_ids, col_map, n, __request__, __user__ or {})
-            j.write_iteration(session, it)
-            await _emit(__event_emitter__, f"📚 Iter {n}: {it.new_chunks} new chunk(s)")
-            terms = await rag.expand_terms(session, terms, __request__, __user__ or {})
-            if n >= self.valves.fixed_iterations:
-                if n >= self.valves.max_iterations:
-                    break
-                if not await rag.should_continue(session, __request__, __user__ or {}):
-                    await _emit(__event_emitter__, "✅ Research complete")
-                    break
-
-        # --- Phase 4: Synthesize ---
+        # =============================================================
+        #  Phase 6: Synthesize + verify
+        # =============================================================
         session.phase = ResearchPhase.SYNTHESIZING
         await _emit(__event_emitter__, "🧠 Synthesizing findings...")
+        rag_sources = kr._build_rag_sources(session, col_map)
         answer = await synth.synthesize(session, __request__, __user__ or {},
+                                        relevant_sources=rag_sources,
                                         event_emitter=__event_emitter__)
         session.phase = ResearchPhase.COMPLETE
+        j.write_manifest(session)
         await _emit(__event_emitter__, f"📁 Journal: deep-research/{slug}/", done=True)
         return answer
