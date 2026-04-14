@@ -15,6 +15,7 @@ from typing import Any, Callable, Dict, Optional
 from .crawl_integration import CrawlClient
 from .domain_discovery import DomainDiscovery
 from .journal import ResearchJournal
+from .knowledge_research import KnowledgeResearcher
 from .models import (
     DiscoveredDomain,
     ResearchPhase,
@@ -32,8 +33,9 @@ logger = logging.getLogger("deep_research")
 class Tools:
     """Deep Research Tools for Open WebUI.
 
-    Two tool methods:
+    Three tool methods:
     - research(query): Quick web-search-based exploration
+    - knowledge_research(query): Iterative RAG across existing knowledge collections
     - deep_research(query): Full pipeline — discover, crawl, RAG, synthesize
 
     Designed as an OWUI Tool (class Tools) that runs inside the user's
@@ -77,6 +79,47 @@ class Tools:
         sub_agent = SubAgent(model_id)
         journal = ResearchJournal(self.valves)
         researcher = QuickResearcher(self.valves, sub_agent, journal)
+
+        return await researcher.run(
+            query=query,
+            user_id=user_id,
+            request=__request__,
+            user=__user__ or {},
+            model_id=model_id,
+            event_emitter=__event_emitter__,
+        )
+
+    async def knowledge_research(
+        self,
+        query: str,
+        __user__: dict = None,
+        __metadata__: dict = None,
+        __event_emitter__=None,
+        __request__=None,
+        __model__: dict = None,
+        __event_call__=None,
+        __chat_id__: str = "",
+        __message_id__: str = "",
+    ) -> str:
+        """Research a topic using existing knowledge collections.
+
+        Identifies which knowledge collections are relevant to the query,
+        then iteratively queries them with expanding search terms to close
+        information gaps. If the knowledge base cannot fully answer the
+        query, recommends external sources to crawl.
+
+        Use this when you already have knowledge collections and want to
+        query them deeply before resorting to web search or crawling.
+
+        Args:
+            query: The research question or topic to investigate.
+        """
+        model_id = SubAgent.resolve_model_id(__metadata__, __model__)
+        user_id = (__user__ or {}).get("id", "")
+
+        sub_agent = SubAgent(model_id)
+        journal = ResearchJournal(self.valves)
+        researcher = KnowledgeResearcher(self.valves, sub_agent, journal)
 
         return await researcher.run(
             query=query,

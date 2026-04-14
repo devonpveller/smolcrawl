@@ -28,10 +28,14 @@ SmolCrawl has three operational modes:
 ```
 User query in OWUI chat
   │
-  ├─→ research()        Quick web-search-only exploration (no crawling)
+  ├─→ research()              Quick web-search-only exploration (no crawling)
   │     └─→ web search → relevance gate → topic extraction → iterate → synthesize
   │
-  └─→ deep_research()   Full pipeline with domain crawling + RAG
+  ├─→ knowledge_research()    RAG-only research across existing knowledge collections
+  │     └─→ anchor → rank collections → iterative RAG with term expansion
+  │         → gap analysis → web search recommendations if exhausted → synthesize
+  │
+  └─→ deep_research()         Full pipeline with domain crawling + RAG
         └─→ anchor → discover domains → crawl via SmolCrawl container
             → iterative RAG across knowledge collections → synthesize → verify
 ```
@@ -59,9 +63,10 @@ integrations/open-webui/          # OWUI integration (deployed via Docker)
   ├── Dockerfile                  # Based on open-webui/pipelines, adds Node.js + smolcrawl
   └── deep_research/              # Modular version (same logic, split into modules)
       ├── models.py               #   Valves, ResearchPhase, dataclasses
-      ├── function.py             #   Tools entry point: research() + deep_research()
+      ├── function.py             #   Tools entry point: research() + knowledge_research() + deep_research()
       ├── sub_agent.py            #   SubAgent: internal LLM calls via generate_chat_completion
       ├── research.py             #   QuickResearcher: web-search-only iteration loop
+      ├── knowledge_research.py   #   KnowledgeResearcher: RAG-only iteration across existing collections
       ├── domain_discovery.py     #   DomainDiscovery: web search + LLM domain scoring
       ├── crawl_integration.py    #   CrawlClient: HTTP to SmolCrawl Pipelines container
       ├── rag_research.py         #   RagResearcher: iterative RAG across OWUI collections
@@ -122,21 +127,28 @@ Dataclass with server intensity control (0.0-1.0):
    SmolCrawl Pipelines container: crawl → augment → upload to OWUI Knowledge Base
    Progress streamed via SSE to chat
 
-4. Iterative Research
-   research():       web search → relevance gate → topic extraction → loop
-   deep_research():  RAG across KB collections → term expansion → loop
-   Both: consecutive-miss detection (3 misses → stop), dedup via seen_urls/seen_chunks
+4. Collection Ranking  (knowledge_research only)
+   List all OWUI KB collections → LLM ranks by relevance to anchor
+   → select top-N collections (high/medium relevance)
 
-5. Gap Analysis
+5. Iterative Research
+   research():             web search → relevance gate → topic extraction → loop
+   knowledge_research():   RAG across ranked KB collections → term expansion → stale detection → loop
+   deep_research():        RAG across KB collections → term expansion → loop
+   All: consecutive-miss/stale detection (3 iterations → stop), dedup via seen_urls/seen_chunks
+
+6. Gap Analysis
    LLM identifies topic gaps + checks for official source presence
+   knowledge_research(): if exhausted, web search to recommend sources for future crawling
    Continues even past target if no official documentation found
 
-6. Synthesis + Verification
+7. Synthesis + Verification
    Chain-of-thought synthesis with [SOURCED]/[INFERRED]/[UNCERTAIN] tagging
    → Programmatic URL scrubbing (remove URLs not in collected sources)
    → LLM verification pass (fabricated URLs, unsupported claims, scope mismatch)
    → Remediation if issues found
    → Credibility report appended to output
+   knowledge_research(): source recommendations table appended if gaps remain
 ```
 
 ### Key Patterns

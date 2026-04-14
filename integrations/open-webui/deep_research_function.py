@@ -1501,6 +1501,367 @@ class _QuickResearcher:
             return {"summary": f"Found {len(texts)} sources.", "gaps": [], "new_terms": [], "covered_aspects": []}
 
 
+# =============================================================================
+#  Knowledge Researcher (RAG-only, no crawling)
+# =============================================================================
+
+_KR_COLLECTION_RELEVANCE_PROMPT = """\
+You are evaluating which existing knowledge collections are relevant to a \
+research query. For each collection, assess whether its content would likely \
+contain useful information.
+
+Given:
+- A RESEARCH ANCHOR describing what the user needs
+- A list of available knowledge collections with names, descriptions, and file counts
+
+Return JSON:
+{"relevant": [
+    {"id": "collection_id", "name": "collection name",
+     "relevance": "high|medium|low",
+     "rationale": "one sentence explaining why"}
+],
+"strategy": "one sentence describing search strategy across these collections"}
+
+Only include collections rated medium or high relevance.
+Respond ONLY with valid JSON.\
+"""
+
+_KR_GAP_ANALYSIS_PROMPT = """\
+You are a research gap analyst. Given a RESEARCH ANCHOR and the findings \
+accumulated so far from knowledge collection queries, identify:
+
+1. What aspects of the original query are well-covered by retrieved evidence
+2. What specific aspects remain UNCOVERED (gaps)
+3. Whether the gaps could plausibly be filled by more targeted queries to \
+the same collections, or whether entirely new knowledge sources are needed
+
+Return JSON:
+{"covered": ["aspects well addressed"],
+ "gaps": ["specific uncovered aspects"],
+ "exhausted": true/false,
+ "gap_search_terms": ["terms that might close gaps within existing collections"],
+ "external_topics": ["topics requiring NEW knowledge sources to address"],
+ "confidence": "high|medium|low"}\
+"""
+
+_KR_SOURCE_RECOMMENDATION_PROMPT = """\
+Based on research gaps identified, recommend web sources the user should \
+crawl to build knowledge collections that would address missing information.
+
+Given:
+- The original research query and anchor
+- Specific gaps that existing collections cannot address
+- Web search results for those gap topics
+
+Return JSON:
+{"recommendations": [
+    {"url": "https://example.com/docs",
+     "domain": "example.com",
+     "title": "Source title",
+     "rationale": "Why this source would fill the gap",
+     "gap_addressed": "Which specific gap this helps with",
+     "priority": "high|medium|low"}
+],
+"crawl_suggestion": "Natural language recommendation for which domains to \
+crawl and why"}\
+"""
+
+
+class _KnowledgeResearcher:
+    """Iterative RAG-only research across existing OWUI knowledge collections."""
+
+    _MAX_STALE = 3
+
+    def __init__(self, valves, sa: _SubAgent, j: _Journal, synth: _Synthesizer):
+        self._v = valves
+        self._sa = sa
+        self._j = j
+        self._synth = synth
+        self._rag = _RagResearcher(valves, sa)
+
+    async def run(self, query: str, user_id: str, request, user: Dict, model_id: str, emitter=None) -> str:
+        slug = _Journal.slugify(query)
+        sdir = self._j.resolve_session_dir(user_id, slug, namespace="knowledge-research")
+        session = ResearchSession(session_id=f"kr-{slug}", query=query, session_dir=sdir, model_id=model_id)
+        self._j.write_prompt(session, model_id)
+        await _emit(emitter, "📋 Knowledge research started")
+
+        # --- Step 1: Extract anchor ---
+        anchor_result = await _extract_anchor(self._sa, query, request, user)
+        session.anchor, initial_terms = anchor_result
+        self._j.write_anchor(session)
+        await _emit(emitter, "🎯 Research anchor extracted")
+
+        # --- Step 2: Discover relevant collections ---
+        session.phase = ResearchPhase.DISCOVERING
+        all_cols = await self._rag.list_collections()
+
+        if not all_cols:
+            await _emit(emitter, "⚠️ No knowledge collections found — searching for source recommendations")
+            recs = await self._recommend_sources(session, ["No existing knowledge collections"], initial_terms, request, user)
+            session.phase = ResearchPhase.COMPLETE
+            answer = self._build_empty_response(session, recs)
+            self._j.write_entry(session.session_dir, "synthesis.md", answer)
+            self._j.write_manifest(session)
+            await _emit(emitter, f"📁 Journal: knowledge-research/{slug}/", done=True)
+            return answer
+
+        relevant = await self._rank_collections(session, all_cols, request, user)
+
+        if not relevant:
+            await _emit(emitter, "⚠️ No relevant collections identified — searching for source recommendations")
+            recs = await self._recommend_sources(session, [f"No collections relevant to: {query}"], initial_terms, request, user)
+            session.phase = ResearchPhase.COMPLETE
+            answer = self._build_empty_response(session, recs)
+            self._j.write_entry(session.session_dir, "synthesis.md", answer)
+            self._j.write_manifest(session)
+            await _emit(emitter, f"📁 Journal: knowledge-research/{slug}/", done=True)
+            return answer
+
+        col_ids = [r["id"] for r in relevant]
+        col_map = {r["id"]: r["name"] for r in relevant}
+        session.relevant_collection_ids = col_ids
+
+        self._j.write_entry(session.session_dir, "01-collections.md",
+                            self._fmt_collections(relevant, all_cols))
+        await _emit(emitter, f"📚 {len(relevant)}/{len(all_cols)} collection(s) selected")
+
+        # --- Step 3: Iterative RAG ---
+        session.phase = ResearchPhase.RESEARCHING
+        terms = initial_terms
+        stale = 0
+
+        for n in range(1, self._v.max_iterations + 1):
+            await _emit(emitter, f"🔍 Iteration {n}: querying {len(col_ids)} collection(s)...")
+            it = await self._rag.run_iteration(session, terms, col_ids, col_map, n, request, user)
+            self._j.write_iteration(session, it)
+
+            if it.new_chunks == 0:
+                stale += 1
+            else:
+                stale = 0
+
+            stale_note = f" (stale: {stale}/{self._MAX_STALE})" if stale > 0 else ""
+            await _emit(emitter, f"📚 Iter {n}: {it.new_chunks} new chunk(s){stale_note}")
+
+            if stale >= self._MAX_STALE:
+                await _emit(emitter, f"⚠️ {self._MAX_STALE} stale iterations — analyzing gaps")
+                break
+
+            terms = await self._rag.expand_terms(session, terms, request, user)
+
+            if n >= self._v.fixed_iterations:
+                if n >= self._v.max_iterations:
+                    break
+                if not await self._rag.should_continue(session, request, user):
+                    await _emit(emitter, "✅ Knowledge sufficiently explored")
+                    break
+
+        # --- Step 4: Gap analysis ---
+        gap = await self._analyze_gaps(session, request, user)
+        gaps = gap.get("gaps", [])
+        exhausted = gap.get("exhausted", False)
+        external = gap.get("external_topics", [])
+
+        gf = len(session.iterations) + 3
+        self._j.write_entry(session.session_dir, f"{gf:02d}-gap-analysis.md", self._fmt_gaps(gap))
+        if gaps:
+            await _emit(emitter, f"🔎 Gaps identified: {', '.join(gaps[:3])}")
+
+        # --- Step 5: Web search recommendations (if gaps + exhausted) ---
+        recs = None
+        if gaps and (exhausted or stale >= self._MAX_STALE):
+            await _emit(emitter, f"🌐 Searching for sources to fill {len(gaps)} gap(s)...")
+            gap_terms = gap.get("gap_search_terms", []) or external or gaps
+            recs = await self._recommend_sources(session, gaps, gap_terms, request, user)
+            rc = len((recs or {}).get("recommendations", []))
+            if rc:
+                self._j.write_entry(session.session_dir, f"{gf + 1:02d}-recommendations.md",
+                                    self._fmt_recs_journal(recs))
+                await _emit(emitter, f"📡 Found {rc} source recommendation(s)")
+
+        # --- Step 6: Synthesis ---
+        session.phase = ResearchPhase.SYNTHESIZING
+        await _emit(emitter, "🧠 Synthesizing findings...")
+
+        rag_sources = self._build_rag_sources(session, col_map)
+        answer = await self._synth.synthesize(session, request, user,
+                                               relevant_sources=rag_sources,
+                                               event_emitter=emitter)
+        if recs:
+            answer += self._fmt_recs_section(recs)
+
+        session.phase = ResearchPhase.COMPLETE
+        self._j.write_manifest(session)
+        await _emit(emitter, f"📁 Journal: knowledge-research/{slug}/", done=True)
+        return answer
+
+    # --- Collection ranking ---
+
+    async def _rank_collections(self, session, collections, request, user):
+        summaries = "\n".join(
+            f"- ID: {c['id']} | Name: {c['name']} | "
+            f"Description: {c.get('description', 'None')} | "
+            f"Files: {len(c.get('data', {}).get('file_ids', []))}"
+            for c in collections)
+        try:
+            r = await self._sa.run_json(_KR_COLLECTION_RELEVANCE_PROMPT,
+                f"{session.anchor}\n\nAvailable collections:\n{summaries}", request, user)
+        except Exception as e:
+            logger.error("Collection ranking failed: %s", e)
+            return []
+        valid = {c["id"]: c for c in collections}
+        ranked = []
+        for entry in r.get("relevant", []):
+            cid = entry.get("id", "")
+            if cid in valid:
+                col = valid[cid].copy()
+                col["_relevance"] = entry.get("relevance", "medium")
+                col["_rationale"] = entry.get("rationale", "")
+                ranked.append(col)
+        return ranked[:self._v.max_collections]
+
+    # --- Gap analysis ---
+
+    async def _analyze_gaps(self, session, request, user):
+        sums = "\n\n".join(
+            f"**Iteration {it.iteration_number}** (terms: {', '.join(it.search_terms)}): "
+            f"{it.summary}\nNew chunks: {it.new_chunks}, Concepts: {', '.join(it.new_concepts)}"
+            for it in session.iterations)
+        try:
+            return await self._sa.run_json(_KR_GAP_ANALYSIS_PROMPT,
+                f"{session.anchor}\n\nCollections: {', '.join(session.relevant_collection_ids)}\n\n"
+                f"Iterations:\n{sums}", request, user)
+        except Exception:
+            return {"covered": [], "gaps": ["analysis failed"], "exhausted": True,
+                    "gap_search_terms": [], "external_topics": [], "confidence": "low"}
+
+    # --- Source recommendations ---
+
+    async def _recommend_sources(self, session, gaps, search_terms, request, user):
+        from open_webui.routers.retrieval import search_web
+        from starlette.concurrency import run_in_threadpool
+
+        engine = getattr(request.app.state.config, "WEB_SEARCH_ENGINE", "")
+        if not engine:
+            return {"recommendations": [], "crawl_suggestion": "No web search engine configured."}
+
+        all_results, seen = [], set()
+        for term in search_terms[:5]:
+            try:
+                results = await run_in_threadpool(search_web, request, engine, term)
+                for r in results or []:
+                    if r.link not in seen:
+                        seen.add(r.link)
+                        all_results.append(r)
+            except Exception as e:
+                logger.warning("Web search for '%s' failed: %s", term, e)
+        if not all_results:
+            return {"recommendations": [], "crawl_suggestion": "Web search returned no results for gap topics."}
+
+        listing = "\n".join(f"- {r.link} | {r.title or ''} | {r.snippet or ''}" for r in all_results[:20])
+        gap_text = "\n".join(f"- {g}" for g in gaps)
+        try:
+            return await self._sa.run_json(_KR_SOURCE_RECOMMENDATION_PROMPT,
+                f"{session.anchor}\n\nKnowledge gaps:\n{gap_text}\n\nWeb search results:\n{listing}",
+                request, user)
+        except Exception:
+            recs, seen_d = [], set()
+            for r in all_results[:5]:
+                try:
+                    d = urlparse(r.link).netloc
+                except Exception:
+                    continue
+                if d not in seen_d:
+                    seen_d.add(d)
+                    recs.append({"url": r.link, "domain": d, "title": r.title or "",
+                                 "rationale": r.snippet or "", "gap_addressed": "general", "priority": "medium"})
+            return {"recommendations": recs, "crawl_suggestion": "Consider crawling these domains."}
+
+    # --- Source building ---
+
+    @staticmethod
+    def _build_rag_sources(session, col_map):
+        col_sums: Dict[str, List[str]] = {}
+        for it in session.iterations:
+            for cn in it.collections_queried:
+                col_sums.setdefault(cn, []).append(it.summary or f"Iteration {it.iteration_number}")
+        sources = []
+        for cid, cname in col_map.items():
+            sums = col_sums.get(cname, [])
+            combined = " | ".join(s[:200] for s in sums[:3])
+            sources.append({"title": cname, "url": f"knowledge-collection://{cid}",
+                            "domain": cname, "summary": combined or "Queried but no summary available"})
+        return sources
+
+    # --- Formatting ---
+
+    @staticmethod
+    def _fmt_collections(relevant, all_cols):
+        lines = ["# Knowledge Collections\n", f"**Total:** {len(all_cols)}\n",
+                 f"**Selected:** {len(relevant)}\n", "\n## Selected\n"]
+        for c in relevant:
+            fc = len(c.get("data", {}).get("file_ids", []))
+            lines.append(f"- **{c['name']}** [{c.get('_relevance', '?')}] ({fc} files)\n  {c.get('_rationale', '')}\n")
+        return "\n".join(lines)
+
+    @staticmethod
+    def _fmt_gaps(analysis):
+        lines = ["# Gap Analysis\n"]
+        for key, label in [("covered", "## Well Covered"), ("gaps", "## Gaps"), ("external_topics", "## Needs External Sources")]:
+            items = analysis.get(key, [])
+            if items:
+                lines.append(f"\n{label}\n")
+                lines.extend(f"- {i}\n" for i in items)
+        lines.append(f"\n**Exhausted:** {analysis.get('exhausted', False)}\n**Confidence:** {analysis.get('confidence', 'unknown')}\n")
+        return "\n".join(lines)
+
+    @staticmethod
+    def _fmt_recs_journal(recs):
+        lines = ["# Source Recommendations\n"]
+        sug = recs.get("crawl_suggestion", "")
+        if sug:
+            lines.append(f"{sug}\n")
+        for i, r in enumerate(recs.get("recommendations", []), 1):
+            lines.append(f"{i}. **{r.get('title', r.get('domain', '?'))}** [{r.get('priority', 'medium')}]\n"
+                         f"   URL: {r.get('url', '')}\n   Gap: {r.get('gap_addressed', '')}\n"
+                         f"   Rationale: {r.get('rationale', '')}\n")
+        return "\n".join(lines)
+
+    @staticmethod
+    def _fmt_recs_section(recs):
+        items = recs.get("recommendations", [])
+        sug = recs.get("crawl_suggestion", "")
+        if not items and not sug:
+            return ""
+        lines = ["\n\n---\n", "## 📡 Recommended Sources for Knowledge Building\n"]
+        if sug:
+            lines.append(f"{sug}\n")
+        if items:
+            lines.append("\n| Priority | Domain | Gap Addressed | Rationale |")
+            lines.append("|----------|--------|---------------|-----------|")
+            for r in items:
+                lines.append(f"| {r.get('priority', 'medium')} | [{r.get('domain', '')}]({r.get('url', '')}) "
+                             f"| {r.get('gap_addressed', '')} | {r.get('rationale', '')[:100]} |")
+        lines.append("\n*💡 Use `deep_research()` to automatically crawl these sources into knowledge collections, "
+                     "or manually trigger a crawl in the SmolCrawl pipeline.*\n")
+        return "\n".join(lines)
+
+    @staticmethod
+    def _build_empty_response(session, recs):
+        lines = [f"# Knowledge Research: {session.query}\n",
+                 "No existing knowledge collections were found relevant to this query.\n"]
+        sug = recs.get("crawl_suggestion", "")
+        if sug:
+            lines.append(f"\n{sug}\n")
+        for r in recs.get("recommendations", []):
+            lines.append(f"- **[{r.get('domain', '')}]({r.get('url', '')})** [{r.get('priority', 'medium')}]\n"
+                         f"  {r.get('rationale', '')}\n  Gap: {r.get('gap_addressed', '')}\n")
+        lines.append("\n*Use `deep_research()` to crawl these domains into knowledge collections, "
+                     "then re-run `knowledge_research()` to query them.*\n")
+        return "\n".join(lines)
+
+
 #  Status emitter helper
 # =============================================================================
 
@@ -1518,8 +1879,9 @@ async def _emit(emitter, msg: str, done: bool = False):
 class Tools:
     """Deep Research Tools for Open WebUI.
 
-    Two tool methods:
+    Three tool methods:
     - research(query): Quick web-search-based exploration
+    - knowledge_research(query): Iterative RAG across existing knowledge collections
     - deep_research(query): Full pipeline — discover, crawl, RAG, synthesize
     """
 
@@ -1562,6 +1924,32 @@ class Tools:
         j = _Journal(self.valves)
         syn = _Synthesizer(self.valves, sa, j)
         return await _QuickResearcher(self.valves, sa, j, syn).run(
+            query, (__user__ or {}).get("id", ""), __request__, __user__ or {}, mid, __event_emitter__)
+
+    async def knowledge_research(
+        self, query: str,
+        __user__: dict = None, __metadata__: dict = None, __event_emitter__=None,
+        __request__=None, __model__: dict = None, __event_call__=None,
+        __chat_id__: str = "", __message_id__: str = "",
+    ) -> str:
+        """Research a topic using existing knowledge collections.
+
+        Identifies which knowledge collections are relevant to the query,
+        then iteratively queries them with expanding search terms to close
+        information gaps. If the knowledge base cannot fully answer the
+        query, recommends external sources to crawl.
+
+        Use this when you already have knowledge collections and want to
+        query them deeply before resorting to web search or crawling.
+
+        Args:
+            query: The research question or topic to investigate.
+        """
+        mid = _SubAgent.resolve_model_id(__metadata__, __model__)
+        sa = _SubAgent(mid)
+        j = _Journal(self.valves)
+        syn = _Synthesizer(self.valves, sa, j)
+        return await _KnowledgeResearcher(self.valves, sa, j, syn).run(
             query, (__user__ or {}).get("id", ""), __request__, __user__ or {}, mid, __event_emitter__)
 
     async def deep_research(
