@@ -80,6 +80,7 @@ smolcrawl-data/cache/crawl/       # diskcache HTTP response cache (auto-created)
 ```
 
 **Two versions of deep research exist and must be kept in sync:**
+
 - `deep_research_function.py` — single-file for direct OWUI deployment (copy-paste into admin panel)
 - `deep_research/` — modular package for development and testing
 
@@ -94,6 +95,7 @@ Fields: `url`, `title`, `content` (markdown), `raw_html`. Method: `get_sections(
 ### `Valves` — OWUI configuration (`deep_research/models.py`)
 
 Pydantic BaseModel exposed in OWUI admin panel. Key fields:
+
 - `smolcrawl_url` / `smolcrawl_api_key` — container connection
 - `owui_base_url` / `owui_api_key` — OWUI API access
 - `max_iterations` (1-15), `fixed_iterations` (1-5), `min_relevant_sources` (1-30)
@@ -108,6 +110,7 @@ Tracks: `anchor`, `discovered_domains`, `crawl_results`, `iterations`, `seen_chu
 ### `ProcessingConfig` — Document processor config (`doc_processor.py`)
 
 Dataclass with server intensity control (0.0-1.0):
+
 - `max_workers`: 1-12, `delay`: 2.0s-0.0s, `timeout`: 30s-10s, `retries`: 5-2
 - Dual format: loads from `.json` or `.yaml`
 
@@ -156,6 +159,7 @@ Dataclass with server intensity control (0.0-1.0):
 **Relevance Gating** — Every web result scored on two axes: relevance to anchor + source authority (0.0-1.0). Authority scale: 1.0=official docs, 0.8=publications, 0.6=reputable blogs, 0.4=forums, 0.2=content farms, 0.0=spam. Sources sorted by authority.
 
 **OWUI Web Search** — `generate_chat_completion()` does NOT trigger web search (metadata flag silently ignored). Must call `search_web()` directly:
+
 ```python
 from open_webui.routers.retrieval import search_web
 from starlette.concurrency import run_in_threadpool
@@ -191,16 +195,19 @@ Progress batched every 15s to reduce SSE traffic. Server intensity controls (Val
 ## Augment Module
 
 `src/smolcrawl/augment.py` — Normalizes pseudo-headers (bold lines, colon-terminated, dates, numbered items, ALL CAPS) into proper `##` markdown headers. Injects metadata blocks after each header:
+
 ```
 [Section: parent > child > item]
 [URL: source-url]
 [Aliases: keyword1, keyword2, ...]
 ```
+
 Used by the pipeline to improve RAG chunking quality before uploading to OWUI.
 
 ## OWUI Knowledge Client
 
 `src/smolcrawl/owui_client.py` — `OwuiKnowledgeClient` manages OWUI knowledge base lifecycle:
+
 - `find_knowledge_base()` / `create_knowledge_base()` — KB CRUD
 - `sync_pages()` — crawl + augment + upload with manifest-based incremental sync (skip unchanged files)
 - Thread-safe with per-collection locking, configurable retry backoff and concurrency
