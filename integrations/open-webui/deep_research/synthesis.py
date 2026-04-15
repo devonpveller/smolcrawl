@@ -186,7 +186,7 @@ class Synthesizer:
                 iteration_summaries.append(content)
 
         all_sources = (relevant_sources or []) + (trail_sources or [])
-        known_urls = self._extract_known_urls(all_sources)
+        known_urls, known_domains = self._extract_known_urls(all_sources)
 
         # Compose the synthesis prompt
         user_prompt = self._build_synthesis_prompt(
@@ -210,7 +210,7 @@ class Synthesizer:
             # Step 1: Programmatic URL scrubbing (fast, deterministic)
             await self._emit(event_emitter, "🔗 Validating URLs against collected sources...")
             answer, scrub_report = self._scrub_fabricated_urls(
-                answer, known_urls
+                answer, known_urls, known_domains
             )
             if scrub_report:
                 logger.warning(
@@ -429,18 +429,33 @@ class Synthesizer:
     # ---- Post-synthesis verification pipeline ----
 
     @staticmethod
-    def _extract_known_urls(sources: List[Dict]) -> Set[str]:
-        """Build a set of all URLs from collected sources."""
-        urls = set()
+    def _extract_known_urls(sources: List[Dict]) -> tuple:
+        """Build known URL set AND known domain set from collected sources.
+
+        Returns (known_urls: set, known_domains: set) where:
+        - known_urls contains exact URLs with trailing-slash variants
+        - known_domains contains netlocs from all source URLs
+        """
+        urls: Set[str] = set()
+        domains: Set[str] = set()
         for s in sources:
             url = s.get("url", "")
             if url and url != "N/A":
                 urls.add(url)
-                # Also add normalized variants (with/without trailing slash)
                 stripped = url.rstrip("/")
                 urls.add(stripped)
                 urls.add(stripped + "/")
-        return urls
+                try:
+                    netloc = urlparse(url).netloc
+                    if netloc:
+                        domains.add(netloc.lower())
+                except Exception:
+                    pass
+            # Also include domain field directly (covers knowledge-collection:// sources)
+            domain = s.get("domain", "")
+            if domain and "://" not in domain:
+                domains.add(domain.lower())
+        return urls, domains
 
     @staticmethod
     def _extract_urls_from_text(text: str) -> List[str]:
@@ -461,29 +476,41 @@ class Synthesizer:
     def _scrub_fabricated_urls(
         text: str,
         known_urls: Set[str],
+        known_domains: Set[str] = None,
     ) -> tuple:
         """Remove URLs from synthesis that don't appear in collected sources.
+
+        Uses three-tier matching:
+        1. Exact URL match (with trailing-slash variants)
+        2. Sub-path/fragment match (URL starts with a known URL)
+        3. Domain match (URL domain is from a known source)
 
         Returns:
             Tuple of (cleaned_text, list_of_removed_urls).
         """
-        if not known_urls:
-            # No sources at all — can't validate
+        if not known_urls and not known_domains:
             return text, []
+        known_domains = known_domains or set()
 
         urls_in_text = Synthesizer._extract_urls_from_text(text)
         fabricated = []
 
         for url in urls_in_text:
             url_clean = url.rstrip("/")
-            # Check if this URL (or a close variant) is in known sources
-            is_known = (
-                url in known_urls
-                or url_clean in known_urls
-                or url_clean + "/" in known_urls
-            )
-            if not is_known:
-                fabricated.append(url)
+            # Check 1: exact URL match (with trailing slash variants)
+            if url in known_urls or url_clean in known_urls or url_clean + "/" in known_urls:
+                continue
+            # Check 2: URL is a sub-path or fragment of a known URL
+            if any(url_clean.startswith(k.rstrip("/")) for k in known_urls if k.startswith("http")):
+                continue
+            # Check 3: URL domain matches a known source domain
+            try:
+                url_domain = urlparse(url).netloc.lower()
+                if url_domain and url_domain in known_domains:
+                    continue
+            except Exception:
+                pass
+            fabricated.append(url)
 
         if not fabricated:
             return text, []

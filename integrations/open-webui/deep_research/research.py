@@ -173,7 +173,10 @@ class QuickResearcher:
             # --- Step 1: Web search ---
             new_terms = [t for t in search_terms if t not in tried_terms]
             if not new_terms and n > 1:
-                await self._emit_status(event_emitter, "\u2705 No new terms to explore")
+                await self._emit_status(
+                    event_emitter,
+                    f"\u2705 No new terms to explore \u2014 {len(relevant_sources)} relevant, {len(trail_sources)} trail collected",
+                )
                 break
             tried_terms.update(new_terms)
 
@@ -182,12 +185,17 @@ class QuickResearcher:
             for term in new_terms[:3]:  # cap at 3 searches per iteration
                 hits = await self._web_search(session, term, request, user)
                 raw.extend(hits)
+            pre_dedup = len(raw)
             raw = [r for r in raw if r.get("url", "") not in seen_urls]
             seen_urls.update(r.get("url", "") for r in raw)
 
             if not raw:
                 consecutive_misses += 1
-                it = IterationResult(n, new_terms, ["web_search"], 0, 0, "No results returned.", [])
+                dedup_note = f" ({pre_dedup} already seen)" if pre_dedup > 0 else ""
+                it = IterationResult(
+                    n, new_terms, ["web_search"], 0, 0,
+                    f"No new results{dedup_note}.", [],
+                )
                 session.iterations.append(it)
                 self._journal.write_iteration(session, it)
                 if consecutive_misses >= 3:
@@ -197,7 +205,8 @@ class QuickResearcher:
                     )
                     break
                 await self._emit_status(
-                    event_emitter, f"\U0001f504 Iter {n}: 0 results \u2014 pivoting"
+                    event_emitter,
+                    f"\U0001f504 Iter {n}: 0 new results{dedup_note} \u2014 pivoting",
                 )
                 search_terms = await self._pivot(session, tried_terms, request, user)
                 continue
@@ -251,11 +260,11 @@ class QuickResearcher:
                     )
                 else:
                     consecutive_misses += 1
-                    summary = f"No results relevant to anchor. Pivoting (miss {consecutive_misses})."
+                    summary = f"No results relevant to anchor ({len(raw)} searched, all dropped). Pivoting (miss {consecutive_misses})."
                     search_terms = await self._pivot(session, tried_terms, request, user)
                     await self._emit_status(
                         event_emitter,
-                        f"\U0001f504 Iter {n}: 0 results \u2014 pivoting ({consecutive_misses})",
+                        f"\U0001f504 Iter {n}: 0 relevant ({len(raw)} dropped) \u2014 pivoting ({consecutive_misses})",
                     )
 
             it = IterationResult(n, new_terms, ["web_search"], len(raw), len(all_kept), summary, [])

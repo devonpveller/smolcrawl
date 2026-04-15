@@ -906,7 +906,7 @@ class _Synthesizer:
                 iter_mds.append(c)
 
         all_sources = (relevant_sources or []) + (trail_sources or [])
-        known_urls = self._extract_known_urls(all_sources)
+        known_urls, known_domains = self._extract_known_urls(all_sources)
 
         parts = [f"# Research Anchor\n\n{session.anchor}\n"]
         parts.append(f"# Original Query\n\n{session.query}\n")
@@ -952,7 +952,7 @@ class _Synthesizer:
 
             # Post-synthesis: programmatic URL scrubbing
             await _emit(event_emitter, "🔗 Validating URLs against collected sources...")
-            answer, scrubbed = self._scrub_fabricated_urls(answer, known_urls)
+            answer, scrubbed = self._scrub_fabricated_urls(answer, known_urls, known_domains)
             if scrubbed:
                 logger.warning("Scrubbed %d fabricated URL(s)", len(scrubbed))
                 await _emit(event_emitter, f"⚠️ Removed {len(scrubbed)} fabricated URL(s)")
@@ -1097,8 +1097,15 @@ class _Synthesizer:
             return synthesis
 
     @staticmethod
-    def _extract_known_urls(sources: List[Dict]) -> set:
+    def _extract_known_urls(sources: List[Dict]) -> tuple:
+        """Build known URL set AND known domain set from collected sources.
+
+        Returns (known_urls: set, known_domains: set) where:
+        - known_urls contains exact URLs with trailing-slash variants
+        - known_domains contains netlocs from all source URLs
+        """
         urls = set()
+        domains = set()
         for s in sources:
             url = s.get("url", "")
             if url and url != "N/A":
@@ -1106,7 +1113,17 @@ class _Synthesizer:
                 stripped = url.rstrip("/")
                 urls.add(stripped)
                 urls.add(stripped + "/")
-        return urls
+                try:
+                    netloc = urlparse(url).netloc
+                    if netloc:
+                        domains.add(netloc.lower())
+                except Exception:
+                    pass
+            # Also include domain field directly (covers knowledge-collection:// sources)
+            domain = s.get("domain", "")
+            if domain and "://" not in domain:
+                domains.add(domain.lower())
+        return urls, domains
 
     @staticmethod
     def _extract_urls_from_text(text: str) -> List[str]:
@@ -1123,16 +1140,31 @@ class _Synthesizer:
         return list(dict.fromkeys(found))
 
     @staticmethod
-    def _scrub_fabricated_urls(text: str, known_urls: set) -> tuple:
+    def _scrub_fabricated_urls(text: str, known_urls: set, known_domains: set = None) -> tuple:
         import re as _re
-        if not known_urls:
+        if not known_urls and not known_domains:
             return text, []
+        known_domains = known_domains or set()
         urls_in_text = _Synthesizer._extract_urls_from_text(text)
         fabricated = []
         for url in urls_in_text:
             url_clean = url.rstrip("/")
-            if not (url in known_urls or url_clean in known_urls or url_clean + "/" in known_urls):
-                fabricated.append(url)
+            # Check 1: exact URL match (with trailing slash variants)
+            if url in known_urls or url_clean in known_urls or url_clean + "/" in known_urls:
+                continue
+            # Check 2: URL is a sub-path or fragment of a known URL
+            # e.g. known: https://docs.example.com/page → allow https://docs.example.com/page#section
+            if any(url_clean.startswith(k.rstrip("/")) for k in known_urls if k.startswith("http")):
+                continue
+            # Check 3: URL domain matches a known source domain
+            # This prevents scrubbing URLs the LLM found in RAG chunks from known sources
+            try:
+                url_domain = urlparse(url).netloc.lower()
+                if url_domain and url_domain in known_domains:
+                    continue
+            except Exception:
+                pass
+            fabricated.append(url)
         if not fabricated:
             return text, []
         cleaned = text
@@ -1359,7 +1391,7 @@ class _QuickResearcher:
             # --- Step 1: Web search ---
             new_terms = [t for t in search_terms if t not in tried_terms]
             if not new_terms and n > 1:
-                await _emit(emitter, "\u2705 No new terms to explore")
+                await _emit(emitter, f"\u2705 No new terms to explore \u2014 {len(relevant_sources)} relevant, {len(trail_sources)} trail collected")
                 break
             tried_terms.update(new_terms)
 
@@ -1368,18 +1400,20 @@ class _QuickResearcher:
             for term in new_terms[:3]:  # cap at 3 searches per iteration
                 hits = await self._web_search(session, term, request, user)
                 raw.extend(hits)
+            pre_dedup = len(raw)
             raw = [r for r in raw if r.get("url", "") not in seen_urls]
             seen_urls.update(r.get("url", "") for r in raw)
 
             if not raw:
                 consecutive_misses += 1
-                it = IterationResult(n, new_terms, ["web_search"], 0, 0, "No results returned.", [])
+                dedup_note = f" ({pre_dedup} already seen)" if pre_dedup > 0 else ""
+                it = IterationResult(n, new_terms, ["web_search"], 0, 0, f"No new results{dedup_note}.", [])
                 session.iterations.append(it)
                 self._j.write_iteration(session, it)
                 if consecutive_misses >= 3:
                     await _emit(emitter, f"\u26a0\ufe0f {consecutive_misses} consecutive misses \u2014 proceeding with {rel_count} relevant")
                     break
-                await _emit(emitter, f"\U0001f504 Iter {n}: 0 results \u2014 pivoting")
+                await _emit(emitter, f"\U0001f504 Iter {n}: 0 new results{dedup_note} \u2014 pivoting")
                 search_terms = await self._pivot(session, tried_terms, request, user)
                 continue
 
@@ -1420,9 +1454,9 @@ class _QuickResearcher:
                     await _emit(emitter, f"\U0001f504 Iter {n}: 0 relevant, {len(trail)} trail \u2014 refining")
                 else:
                     consecutive_misses += 1
-                    summary = f"No results relevant to anchor. Pivoting (miss {consecutive_misses})."
+                    summary = f"No results relevant to anchor ({len(raw)} searched, all dropped). Pivoting (miss {consecutive_misses})."
                     search_terms = await self._pivot(session, tried_terms, request, user)
-                    await _emit(emitter, f"\U0001f504 Iter {n}: 0 results \u2014 pivoting ({consecutive_misses})")
+                    await _emit(emitter, f"\U0001f504 Iter {n}: 0 relevant ({len(raw)} dropped) \u2014 pivoting ({consecutive_misses})")
 
             it = IterationResult(n, new_terms, ["web_search"], len(raw), len(all_kept), summary, [])
             session.iterations.append(it)
