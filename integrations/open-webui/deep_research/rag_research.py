@@ -5,6 +5,7 @@ Single Responsibility: Only handles querying knowledge collections and expanding
 Encapsulation: OWUI API details and chunk deduplication are internal.
 """
 
+import asyncio
 import logging
 from typing import Any, Dict, List, Optional
 
@@ -12,6 +13,19 @@ import httpx
 
 from .models import IterationResult, RetrievedChunk, ResearchSession, Valves
 from .sub_agent import SubAgent
+
+# Internal OWUI imports — available when Tool runs inside OWUI process.
+# Guarded by try/except for Pipeline deployments (separate container).
+try:
+    from open_webui.retrieval.utils import (
+        query_collection as _owui_query_collection,
+        query_collection_with_hybrid_search as _owui_query_hybrid,
+    )
+    from open_webui.config import RAG_EMBEDDING_QUERY_PREFIX
+
+    _HAS_OWUI_INTERNALS = True
+except ImportError:
+    _HAS_OWUI_INTERNALS = False
 
 logger = logging.getLogger("deep_research.rag_research")
 
@@ -44,38 +58,146 @@ class RagResearcher:
     Queries multiple collections with expanding search terms, deduplicates
     chunks, and uses an LLM sub-agent for term expansion and continue
     decisions.
+
+    When a ``request`` object is available (OWUI Tool deployment), API
+    calls go through the ASGI app directly — no network needed. Falls
+    back to HTTP via ``owui_base_url`` for Pipeline deployments.
     """
 
     def __init__(self, valves: Valves, sub_agent: SubAgent):
         self._valves = valves
         self._sub_agent = sub_agent
 
-    async def list_collections(self) -> List[Dict]:
+    # ------------------------------------------------------------------
+    # Internal HTTP / ASGI transport
+    # ------------------------------------------------------------------
+
+    def _build_auth_headers(self, request: Any = None) -> Dict:
+        """Build auth headers from Valves or forward from request."""
+        headers: Dict[str, str] = {
+            "Accept": "application/json",
+            "Content-Type": "application/json",
+        }
+        if self._valves.owui_api_key:
+            headers["Authorization"] = f"Bearer {self._valves.owui_api_key}"
+        elif request:
+            auth = getattr(request, "headers", {})
+            if hasattr(auth, "get"):
+                val = auth.get("authorization", "")
+                if val:
+                    headers["Authorization"] = val
+        return headers
+
+    async def _get(
+        self, path: str, request: Any = None
+    ) -> httpx.Response:
+        """GET an OWUI API endpoint, preferring internal ASGI transport."""
+        headers = self._build_auth_headers(request)
+        cookies = dict(request.cookies) if request and hasattr(request, "cookies") else {}
+
+        # Try 1: ASGI transport (Tool runs inside OWUI — no network)
+        if request and hasattr(request, "app"):
+            try:
+                transport = httpx.ASGITransport(app=request.app)
+                async with httpx.AsyncClient(
+                    transport=transport,
+                    base_url="http://internal",
+                    headers=headers,
+                    cookies=cookies,
+                    timeout=30.0,
+                ) as client:
+                    resp = await client.get(path)
+                    resp.raise_for_status()
+                    return resp
+            except Exception as e:
+                logger.debug(
+                    "ASGI transport GET %s failed, falling back to HTTP: %s",
+                    path, e,
+                )
+
+        # Try 2: HTTP to configured owui_base_url
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            resp = await client.get(
+                f"{self._valves.owui_base_url}{path}",
+                headers=headers,
+            )
+            resp.raise_for_status()
+            return resp
+
+    async def _post(
+        self, path: str, json_body: Dict, request: Any = None
+    ) -> httpx.Response:
+        """POST to an OWUI API endpoint, preferring internal ASGI transport."""
+        headers = self._build_auth_headers(request)
+        cookies = dict(request.cookies) if request and hasattr(request, "cookies") else {}
+
+        # Try 1: ASGI transport
+        if request and hasattr(request, "app"):
+            try:
+                transport = httpx.ASGITransport(app=request.app)
+                async with httpx.AsyncClient(
+                    transport=transport,
+                    base_url="http://internal",
+                    headers=headers,
+                    cookies=cookies,
+                    timeout=30.0,
+                ) as client:
+                    resp = await client.post(path, json=json_body)
+                    resp.raise_for_status()
+                    return resp
+            except Exception as e:
+                logger.debug(
+                    "ASGI transport POST %s failed, falling back to HTTP: %s",
+                    path, e,
+                )
+
+        # Try 2: HTTP fallback
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            resp = await client.post(
+                f"{self._valves.owui_base_url}{path}",
+                headers=headers,
+                json=json_body,
+            )
+            resp.raise_for_status()
+            return resp
+
+    # ------------------------------------------------------------------
+    # Collection listing & querying
+    # ------------------------------------------------------------------
+
+    async def list_collections(self, request: Any = None) -> tuple:
         """List all knowledge collections from OWUI.
 
+        Args:
+            request: OWUI ``__request__`` object. When provided, the call
+                goes through the ASGI app directly (no network).
+
         Returns:
-            List of collection dicts from the OWUI API.
+            Tuple of (list_of_collections, error_string).
+            On success error_string is empty. On failure the list is empty
+            and error_string describes the problem.
         """
         try:
-            async with httpx.AsyncClient(timeout=30.0) as client:
-                response = await client.get(
-                    f"{self._valves.owui_base_url}/api/v1/knowledge/",
-                    headers={
-                        "Authorization": f"Bearer {self._valves.owui_api_key}",
-                        "Accept": "application/json",
-                    },
-                )
-                response.raise_for_status()
-                data = response.json()
+            response = await self._get("/api/v1/knowledge/", request)
+            data = response.json()
 
-                # Handle both list and paginated dict responses
-                if isinstance(data, dict):
-                    return data.get("items", [])
-                return data
+            # Handle both list and paginated dict responses
+            if isinstance(data, dict):
+                return data.get("items", []), ""
+            return data, ""
 
-        except (httpx.HTTPError, Exception) as e:
-            logger.error("Failed to list collections: %s", e)
-            return []
+        except httpx.HTTPStatusError as e:
+            msg = f"OWUI API returned HTTP {e.response.status_code}"
+            logger.error("Failed to list collections: %s", msg)
+            return [], msg
+        except httpx.ConnectError as e:
+            msg = f"Cannot connect to OWUI at {self._valves.owui_base_url}: {e}"
+            logger.error("Failed to list collections: %s", msg)
+            return [], msg
+        except Exception as e:
+            msg = f"Failed to list collections: {e}"
+            logger.error(msg)
+            return [], msg
 
     async def query_collection(
         self,
@@ -83,45 +205,95 @@ class RagResearcher:
         query: str,
         collection_name: str = "",
         k_override: Optional[int] = None,
+        request: Any = None,
+        file_ids: Optional[List[str]] = None,
     ) -> List[RetrievedChunk]:
-        """Query a single knowledge collection via OWUI's retrieval API.
+        """Query a knowledge collection via OWUI's retrieval internals.
+
+        Primary path: imports OWUI's ``query_collection`` directly —
+        zero HTTP overhead, same code path as OWUI's own chat.
+        Fallback: ASGI POST to ``/api/v1/retrieval/query/collection``.
+
+        OWUI stores vector embeddings per-file under collection names
+        ``file-{file_id}``.  When ``file_ids`` is provided, each file
+        is prefixed accordingly.  When omitted, ``collection_id`` (the
+        KB UUID) is used directly.
 
         Args:
-            collection_id: UUID of the collection to search.
+            collection_id: UUID of the knowledge base (used for attribution).
             query: Natural language query string.
             collection_name: Human-readable name for logging.
-            k_override: Override the default top-k value. When None,
-                uses ``valves.top_k_per_collection``.
+            k_override: Override the default top-k value.
+            request: OWUI ``__request__`` object for internal transport.
+            file_ids: File UUIDs belonging to this KB. When provided,
+                each file is queried as ``file-{file_id}``.
 
         Returns:
             List of RetrievedChunk objects.
         """
         effective_k = k_override if k_override is not None else self._valves.top_k_per_collection
-        try:
-            async with httpx.AsyncClient(timeout=30.0) as client:
-                response = await client.post(
-                    f"{self._valves.owui_base_url}/api/v1/retrieval/query",
-                    headers={
-                        "Authorization": f"Bearer {self._valves.owui_api_key}",
-                        "Content-Type": "application/json",
-                    },
-                    json={
-                        "collection_name": collection_id,
-                        "query": query,
-                        "k": effective_k,
-                        "r": 0.0,
-                    },
+
+        # Build vector-store collection names (OWUI convention: file-{uuid})
+        if file_ids:
+            target_names = [f"file-{fid}" for fid in file_ids]
+        else:
+            target_names = [collection_id]
+
+        # --- Primary: OWUI internal import (Tool runs inside OWUI) ---
+        if (
+            _HAS_OWUI_INTERNALS
+            and request
+            and hasattr(request, "app")
+            and hasattr(request.app.state, "EMBEDDING_FUNCTION")
+        ):
+            try:
+                embedding_fn = (
+                    lambda query_texts, prefix: request.app.state.EMBEDDING_FUNCTION(
+                        query_texts, prefix=prefix
+                    )
                 )
-                response.raise_for_status()
-                data = response.json()
+                result = await _owui_query_collection(
+                    request,
+                    collection_names=target_names,
+                    queries=[query],
+                    embedding_function=embedding_fn,
+                    k=effective_k,
+                )
+                chunks = self._parse_retrieval_response(
+                    result, collection_id, collection_name
+                )
+                logger.debug(
+                    "Internal query OK: %d chunks from %s (%d targets)",
+                    len(chunks), collection_name or collection_id,
+                    len(target_names),
+                )
+                return chunks
+            except Exception as e:
+                logger.warning(
+                    "Internal query_collection failed for %s, "
+                    "falling back to ASGI: %s",
+                    collection_name or collection_id, e,
+                )
 
-            return self._parse_retrieval_response(
-                data, collection_id, collection_name
+        # --- Fallback: ASGI / HTTP to /api/v1/retrieval/query/collection ---
+        try:
+            response = await self._post(
+                "/api/v1/retrieval/query/collection",
+                {
+                    "collection_names": target_names,
+                    "query": query,
+                    "k": effective_k,
+                    "r": 0.0,
+                },
+                request,
             )
-
+            return self._parse_retrieval_response(
+                response.json(), collection_id, collection_name
+            )
         except (httpx.HTTPError, Exception) as e:
-            logger.error(
-                "Query failed for collection %s: %s", collection_id, e
+            logger.debug(
+                "ASGI/HTTP query failed for %s (KB %s): %s",
+                target_names, collection_id, e,
             )
             return []
 
@@ -135,17 +307,22 @@ class RagResearcher:
         request: Any,
         user: Dict,
         k_override: Optional[int] = None,
+        file_ids_map: Optional[Dict[str, List[str]]] = None,
     ) -> IterationResult:
         """Execute a single research iteration: query + summarize.
 
         Args:
             session: The active research session (for deduplication state).
             search_terms: Terms to query across collections.
-            collection_ids: UUIDs of collections to search.
-            collection_names: Mapping of collection ID to human-readable name.
+            collection_ids: UUIDs of knowledge bases to search.
+            collection_names: Mapping of KB ID to human-readable name.
             iteration_number: Current iteration index (1-based).
             request: OWUI __request__ object.
             user: OWUI __user__ dict.
+            k_override: Override the default top-k value.
+            file_ids_map: Mapping of KB ID to its file UUIDs. When provided,
+                queries are made against individual file collections instead
+                of the KB UUID directly.
 
         Returns:
             IterationResult with findings and LLM summary.
@@ -156,11 +333,14 @@ class RagResearcher:
         # Query each collection with each term
         for term in search_terms:
             for col_id in collection_ids:
+                file_ids = (file_ids_map or {}).get(col_id)
                 chunks = await self.query_collection(
                     collection_id=col_id,
                     query=term,
                     collection_name=collection_names.get(col_id, col_id),
                     k_override=k_override,
+                    request=request,
+                    file_ids=file_ids,
                 )
                 for chunk in chunks:
                     all_chunks.append(chunk)

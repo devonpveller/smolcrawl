@@ -35,9 +35,10 @@ User query in OWUI chat
   │     └─→ anchor → rank collections → iterative RAG with term expansion
   │         → gap analysis → web search recommendations if exhausted → synthesize
   │
-  └─→ deep_research()         Full pipeline with domain crawling + RAG
-        └─→ anchor → discover domains → crawl via SmolCrawl container
-            → iterative RAG across knowledge collections → synthesize → verify
+  └─→ deep_research()         Hybrid: knowledge_research → research → crawl → knowledge_research
+        └─→ anchor → rank existing collections → iterative RAG (pass 1)
+            → gap analysis → web search for sources → crawl via SmolCrawl
+            → iterative RAG (pass 2, expanded collections) → synthesize → verify
 ```
 
 ## Project Structure
@@ -119,33 +120,31 @@ Dataclass with server intensity control (0.0-1.0):
 ### Pipeline Flow
 
 ```
-1. Anchor Extraction
+1. Anchor Extraction  (all tools)
    Query → LLM decomposes into research anchor + initial_search_terms (3-5 diverse queries)
 
-2. Domain Discovery  (deep_research only)
-   Web search → LLM scores domains (0.0-1.0) → check existing OWUI collections
-   → auto-approve uncovered domains → trigger crawl via SmolCrawl container
-
-3. Crawling  (deep_research only)
-   SmolCrawl Pipelines container: crawl → augment → upload to OWUI Knowledge Base
-   Progress streamed via SSE to chat
-
-4. Collection Ranking  (knowledge_research only)
+2. Collection Ranking  (knowledge_research + deep_research)
    List all OWUI KB collections → LLM ranks by relevance to anchor
    → select top-N collections (high/medium relevance)
 
-5. Iterative Research
+3. Iterative Research
    research():             web search → relevance gate → topic extraction → loop
    knowledge_research():   RAG across ranked KB collections → term expansion → stale detection → loop
-   deep_research():        RAG across KB collections → term expansion → loop
+   deep_research():        runs knowledge_research pass 1 → then research for sources → crawl → knowledge_research pass 2
    All: consecutive-miss/stale detection (3 iterations → stop), dedup via seen_urls/seen_chunks
 
-6. Gap Analysis
+4. Gap Analysis  (knowledge_research + deep_research)
    LLM identifies topic gaps + checks for official source presence
    knowledge_research(): if exhausted, web search to recommend sources for future crawling
-   Continues even past target if no official documentation found
+   deep_research(): if gaps remain after pass 1, proceeds to source discovery + crawling
 
-7. Synthesis + Verification
+5. Source Discovery + Crawling  (deep_research only)
+   Web search → LLM recommends domains/sources to fill gaps
+   → SmolCrawl Pipelines container: crawl → augment → upload to OWUI Knowledge Base
+   → Progress streamed via SSE to chat
+   → knowledge_research pass 2 on expanded collections
+
+6. Synthesis + Verification  (all tools)
    Chain-of-thought synthesis with [SOURCED]/[INFERRED]/[UNCERTAIN] tagging
    → Programmatic URL scrubbing (remove URLs not in collected sources)
    → LLM verification pass (fabricated URLs, unsupported claims, scope mismatch)

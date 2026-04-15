@@ -196,7 +196,7 @@ class Tools:
         #  Phase 1: Knowledge Research — query existing collections
         # =============================================================
         session.phase = ResearchPhase.DISCOVERING
-        all_collections = await rag.list_collections()
+        all_collections, _ = await rag.list_collections(__request__)
 
         # Rank existing collections
         kr = KnowledgeResearcher(self.valves, sub_agent, journal)
@@ -206,6 +206,13 @@ class Tools:
         collection_ids = [r["id"] for r in relevant]
         collection_map = {r["id"]: r["name"] for r in relevant}
         session.relevant_collection_ids = list(collection_ids)
+
+        # Build file-level query targets (OWUI stores embeddings per-file)
+        file_ids_map = {}
+        for r in relevant:
+            fids = r.get("data", {}).get("file_ids", [])
+            if fids:
+                file_ids_map[r["id"]] = fids
 
         await self._emit_status(
             __event_emitter__,
@@ -239,6 +246,7 @@ class Tools:
                     iteration_number=iter_num,
                     request=__request__,
                     user=__user__ or {},
+                    file_ids_map=file_ids_map,
                 )
                 journal.write_iteration(session, iteration)
 
@@ -384,8 +392,15 @@ class Tools:
             )
 
             # Refresh collection list to pick up newly created KBs
-            all_collections = await rag.list_collections()
+            all_collections, _ = await rag.list_collections(__request__)
             collection_map = {c["id"]: c["name"] for c in all_collections}
+
+            # Refresh file_ids_map with newly crawled collections
+            file_ids_map = {}
+            for col in all_collections:
+                fids = col.get("data", {}).get("file_ids", [])
+                if fids:
+                    file_ids_map[col["id"]] = fids
 
             for result in session.crawl_results:
                 if result.success:
@@ -439,6 +454,7 @@ class Tools:
                     iteration_number=iter_num,
                     request=__request__,
                     user=__user__ or {},
+                    file_ids_map=file_ids_map,
                 )
                 journal.write_iteration(session, iteration)
 

@@ -178,7 +178,37 @@ class KnowledgeResearcher:
 
         # --- Step 2: Discover relevant collections ---
         session.phase = ResearchPhase.DISCOVERING
-        all_collections = await self._rag.list_collections()
+        if target_collection:
+            await self._emit(
+                event_emitter,
+                f"📌 Targeting collection: {target_collection}",
+            )
+
+        all_collections, api_error = await self._rag.list_collections(request)
+
+        if api_error:
+            await self._emit(
+                event_emitter,
+                f"❌ OWUI API error: {api_error}",
+            )
+            session.phase = ResearchPhase.FAILED
+            answer = (
+                f"# Knowledge Research Failed\n\n"
+                f"Could not retrieve knowledge collections from OWUI.\n\n"
+                f"**Error:** {api_error}\n\n"
+                f"**Troubleshooting:**\n"
+                f"- Check that `owui_base_url` is correct in Valves\n"
+                f"- Check that `owui_api_key` is set and valid\n"
+                f"- Verify OWUI is running and accessible\n"
+            )
+            self._journal.write_synthesis(session, answer)
+            self._journal.write_manifest(session)
+            await self._emit(
+                event_emitter,
+                f"📁 Journal: knowledge-research/{slug}/",
+                done=True,
+            )
+            return answer
 
         if not all_collections:
             await self._emit(
@@ -263,6 +293,14 @@ class KnowledgeResearcher:
         collection_map = {r["id"]: r["name"] for r in relevant}
         session.relevant_collection_ids = collection_ids
 
+        # Build file-level query targets — OWUI stores vector embeddings
+        # per-file, so we must query each file_id individually.
+        file_ids_map: Dict[str, List[str]] = {}
+        for r in relevant:
+            fids = r.get("data", {}).get("file_ids", [])
+            if fids:
+                file_ids_map[r["id"]] = fids
+
         # Compute adaptive k based on collection sizes
         effective_k = self._compute_adaptive_k(relevant)
 
@@ -308,6 +346,7 @@ class KnowledgeResearcher:
                 request=request,
                 user=user,
                 k_override=effective_k,
+                file_ids_map=file_ids_map,
             )
             self._journal.write_iteration(session, iteration)
 
@@ -443,17 +482,33 @@ class KnowledgeResearcher:
         name: str,
         collections: List[Dict],
     ) -> List[Dict]:
-        """Find a collection by name (case-insensitive).
+        """Find a collection by name (case-insensitive, with partial fallback).
+
+        Matching priority:
+        1. Exact match (case-insensitive)
+        2. Substring match — collection name contains the target or vice versa
 
         Returns a single-element list for consistency with _rank_collections.
         """
         target = name.strip().lower()
+
+        # Pass 1: exact match
         for c in collections:
             if c.get("name", "").strip().lower() == target:
                 col = c.copy()
                 col["_relevance"] = "high"
-                col["_rationale"] = "User-specified collection"
+                col["_rationale"] = "User-specified collection (exact match)"
                 return [col]
+
+        # Pass 2: substring match (either direction)
+        for c in collections:
+            col_name = c.get("name", "").strip().lower()
+            if target in col_name or col_name in target:
+                col = c.copy()
+                col["_relevance"] = "high"
+                col["_rationale"] = f"User-specified collection (partial match: '{c.get('name', '')}')"
+                return [col]
+
         return []
 
     def _compute_adaptive_k(self, collections: List[Dict]) -> int:

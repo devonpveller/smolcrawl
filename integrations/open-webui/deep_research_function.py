@@ -17,6 +17,7 @@ requirements: httpx, pydantic
 #  Install: OWUI Workspace → Tools → (+) → Paste this file
 # =============================================================================
 
+import asyncio
 import hashlib
 import json
 import logging
@@ -32,6 +33,19 @@ from urllib.parse import urlparse
 
 import httpx
 from pydantic import BaseModel, Field
+
+# Internal OWUI imports — available when Tool runs inside OWUI process.
+# Guarded for Pipeline deployments (separate container).
+try:
+    from open_webui.retrieval.utils import (
+        query_collection as _owui_query_collection,
+        query_collection_with_hybrid_search as _owui_query_hybrid,
+    )
+    from open_webui.config import RAG_EMBEDDING_QUERY_PREFIX
+
+    _HAS_OWUI_INTERNALS = True
+except ImportError:
+    _HAS_OWUI_INTERNALS = False
 
 logger = logging.getLogger("deep_research")
 
@@ -614,39 +628,138 @@ class _RagResearcher:
         self._v = valves
         self._sa = sub_agent
 
-    async def list_collections(self) -> List[Dict]:
-        try:
-            async with httpx.AsyncClient(timeout=30.0) as client:
-                resp = await client.get(f"{self._v.owui_base_url}/api/v1/knowledge/",
-                    headers={"Authorization": f"Bearer {self._v.owui_api_key}", "Accept": "application/json"})
-                resp.raise_for_status()
-                data = resp.json()
-                return data.get("items", []) if isinstance(data, dict) else data
-        except Exception as e:
-            logger.error("Failed to list collections: %s", e)
-            return []
+    # ------------------------------------------------------------------
+    # Internal HTTP / ASGI transport
+    # ------------------------------------------------------------------
 
-    async def query_collection(self, col_id: str, query: str, col_name: str = "", k_override: int = None) -> List[RetrievedChunk]:
-        effective_k = k_override if k_override is not None else self._v.top_k_per_collection
+    def _build_auth_headers(self, request=None) -> Dict:
+        headers = {"Accept": "application/json", "Content-Type": "application/json"}
+        if self._v.owui_api_key:
+            headers["Authorization"] = f"Bearer {self._v.owui_api_key}"
+        elif request:
+            auth = getattr(request, "headers", {})
+            if hasattr(auth, "get"):
+                val = auth.get("authorization", "")
+                if val:
+                    headers["Authorization"] = val
+        return headers
+
+    async def _get(self, path: str, request=None) -> httpx.Response:
+        headers = self._build_auth_headers(request)
+        cookies = dict(request.cookies) if request and hasattr(request, "cookies") else {}
+        if request and hasattr(request, "app"):
+            try:
+                transport = httpx.ASGITransport(app=request.app)
+                async with httpx.AsyncClient(transport=transport, base_url="http://internal",
+                                             headers=headers, cookies=cookies, timeout=30.0) as client:
+                    resp = await client.get(path)
+                    resp.raise_for_status()
+                    return resp
+            except Exception as e:
+                logger.debug("ASGI GET %s failed, falling back to HTTP: %s", path, e)
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            resp = await client.get(f"{self._v.owui_base_url}{path}", headers=headers)
+            resp.raise_for_status()
+            return resp
+
+    async def _post(self, path: str, json_body: Dict, request=None) -> httpx.Response:
+        headers = self._build_auth_headers(request)
+        cookies = dict(request.cookies) if request and hasattr(request, "cookies") else {}
+        if request and hasattr(request, "app"):
+            try:
+                transport = httpx.ASGITransport(app=request.app)
+                async with httpx.AsyncClient(transport=transport, base_url="http://internal",
+                                             headers=headers, cookies=cookies, timeout=30.0) as client:
+                    resp = await client.post(path, json=json_body)
+                    resp.raise_for_status()
+                    return resp
+            except Exception as e:
+                logger.debug("ASGI POST %s failed, falling back to HTTP: %s", path, e)
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            resp = await client.post(f"{self._v.owui_base_url}{path}", headers=headers, json=json_body)
+            resp.raise_for_status()
+            return resp
+
+    # ------------------------------------------------------------------
+    # Collection listing & querying
+    # ------------------------------------------------------------------
+
+    async def list_collections(self, request=None) -> tuple:
         try:
-            async with httpx.AsyncClient(timeout=30.0) as client:
-                resp = await client.post(f"{self._v.owui_base_url}/api/v1/retrieval/query",
-                    headers={"Authorization": f"Bearer {self._v.owui_api_key}", "Content-Type": "application/json"},
-                    json={"collection_name": col_id, "query": query, "k": effective_k, "r": 0.0})
-                resp.raise_for_status()
-                return self._parse_retrieval(resp.json(), col_id, col_name)
+            resp = await self._get("/api/v1/knowledge/", request)
+            data = resp.json()
+            items = data.get("items", []) if isinstance(data, dict) else data
+            return items, ""
+        except httpx.HTTPStatusError as e:
+            msg = f"OWUI API returned HTTP {e.response.status_code}"
+            logger.error("Failed to list collections: %s", msg)
+            return [], msg
+        except httpx.ConnectError as e:
+            msg = f"Cannot connect to OWUI at {self._v.owui_base_url}: {e}"
+            logger.error("Failed to list collections: %s", msg)
+            return [], msg
         except Exception as e:
-            logger.error("Query failed for %s: %s", col_id, e)
+            msg = f"Failed to list collections: {e}"
+            logger.error(msg)
+            return [], msg
+
+    async def query_collection(self, col_id: str, query: str, col_name: str = "",
+                               k_override: int = None, request=None,
+                               file_ids: List[str] = None) -> List[RetrievedChunk]:
+        effective_k = k_override if k_override is not None else self._v.top_k_per_collection
+
+        # Build vector-store collection names (OWUI convention: file-{uuid})
+        if file_ids:
+            target_names = [f"file-{fid}" for fid in file_ids]
+        else:
+            target_names = [col_id]
+
+        # --- Primary: OWUI internal import (Tool runs inside OWUI) ---
+        if (_HAS_OWUI_INTERNALS and request
+                and hasattr(request, "app")
+                and hasattr(request.app.state, "EMBEDDING_FUNCTION")):
+            try:
+                embedding_fn = (
+                    lambda query_texts, prefix: request.app.state.EMBEDDING_FUNCTION(
+                        query_texts, prefix=prefix
+                    )
+                )
+                result = await _owui_query_collection(
+                    request,
+                    collection_names=target_names,
+                    queries=[query],
+                    embedding_function=embedding_fn,
+                    k=effective_k,
+                )
+                chunks = self._parse_retrieval(result, col_id, col_name)
+                logger.debug("Internal query OK: %d chunks from %s (%d targets)",
+                             len(chunks), col_name or col_id, len(target_names))
+                return chunks
+            except Exception as e:
+                logger.warning("Internal query_collection failed for %s, "
+                               "falling back to ASGI: %s", col_name or col_id, e)
+
+        # --- Fallback: ASGI / HTTP to /api/v1/retrieval/query/collection ---
+        try:
+            resp = await self._post("/api/v1/retrieval/query/collection",
+                {"collection_names": target_names, "query": query, "k": effective_k, "r": 0.0}, request)
+            return self._parse_retrieval(resp.json(), col_id, col_name)
+        except Exception as e:
+            logger.debug("ASGI/HTTP query failed for %s (KB %s): %s", target_names, col_id, e)
             return []
 
     async def run_iteration(self, session: ResearchSession, terms: List[str],
                             col_ids: List[str], col_names: Dict[str, str],
                             iter_num: int, request, user: Dict,
-                            k_override: int = None) -> IterationResult:
+                            k_override: int = None,
+                            file_ids_map: Dict[str, List[str]] = None) -> IterationResult:
         all_chunks, new_chunks = [], []
         for term in terms:
             for cid in col_ids:
-                for chunk in await self.query_collection(cid, term, col_names.get(cid, cid), k_override=k_override):
+                fids = (file_ids_map or {}).get(cid)
+                for chunk in await self.query_collection(cid, term, col_names.get(cid, cid),
+                                                         k_override=k_override, request=request,
+                                                         file_ids=fids):
                     all_chunks.append(chunk)
                     if session.add_seen_chunk(cid, chunk.chunk_hash):
                         new_chunks.append(chunk)
@@ -1598,7 +1711,27 @@ class _KnowledgeResearcher:
 
         # --- Step 2: Discover relevant collections ---
         session.phase = ResearchPhase.DISCOVERING
-        all_cols = await self._rag.list_collections()
+        if target_collection:
+            await _emit(emitter, f"📌 Targeting collection: {target_collection}")
+
+        all_cols, api_error = await self._rag.list_collections(request)
+
+        if api_error:
+            await _emit(emitter, f"❌ OWUI API error: {api_error}")
+            session.phase = ResearchPhase.FAILED
+            answer = (
+                f"# Knowledge Research Failed\n\n"
+                f"Could not retrieve knowledge collections from OWUI.\n\n"
+                f"**Error:** {api_error}\n\n"
+                f"**Troubleshooting:**\n"
+                f"- Check that `owui_base_url` is correct in Valves\n"
+                f"- Check that `owui_api_key` is set and valid\n"
+                f"- Verify OWUI is running and accessible\n"
+            )
+            self._j.write_entry(session.session_dir, "synthesis.md", answer)
+            self._j.write_manifest(session)
+            await _emit(emitter, f"📁 Journal: knowledge-research/{slug}/", done=True)
+            return answer
 
         if not all_cols:
             await _emit(emitter, "⚠️ No knowledge collections found — searching for source recommendations")
@@ -1646,6 +1779,13 @@ class _KnowledgeResearcher:
         col_map = {r["id"]: r["name"] for r in relevant}
         session.relevant_collection_ids = col_ids
 
+        # Build file-level query targets (OWUI stores embeddings per-file)
+        file_ids_map = {}
+        for r in relevant:
+            fids = r.get("data", {}).get("file_ids", [])
+            if fids:
+                file_ids_map[r["id"]] = fids
+
         # Compute adaptive k based on collection sizes
         effective_k = self._compute_adaptive_k(relevant)
 
@@ -1666,7 +1806,7 @@ class _KnowledgeResearcher:
 
         for n in range(1, self._v.max_iterations + 1):
             await _emit(emitter, f"🔍 Iteration {n}: querying {len(col_ids)} collection(s)...")
-            it = await self._rag.run_iteration(session, terms, col_ids, col_map, n, request, user, k_override=effective_k)
+            it = await self._rag.run_iteration(session, terms, col_ids, col_map, n, request, user, k_override=effective_k, file_ids_map=file_ids_map)
             self._j.write_iteration(session, it)
 
             if it.new_chunks == 0:
@@ -1735,11 +1875,20 @@ class _KnowledgeResearcher:
     @staticmethod
     def _find_collection_by_name(name, collections):
         target = name.strip().lower()
+        # Pass 1: exact match
         for c in collections:
             if c.get("name", "").strip().lower() == target:
                 col = c.copy()
                 col["_relevance"] = "high"
-                col["_rationale"] = "User-specified collection"
+                col["_rationale"] = "User-specified collection (exact match)"
+                return [col]
+        # Pass 2: substring match (either direction)
+        for c in collections:
+            col_name = c.get("name", "").strip().lower()
+            if target in col_name or col_name in target:
+                col = c.copy()
+                col["_relevance"] = "high"
+                col["_rationale"] = f"User-specified collection (partial match: '{c.get('name', '')}')"
                 return [col]
         return []
 
@@ -2053,11 +2202,19 @@ class Tools:
         #  Phase 1: Knowledge Research — query existing collections
         # =============================================================
         session.phase = ResearchPhase.DISCOVERING
-        all_cols = await rag.list_collections()
+        all_cols, _ = await rag.list_collections(__request__)
         relevant = await kr._rank_collections(session, all_cols, __request__, __user__ or {})
         col_ids = [r["id"] for r in relevant]
         col_map = {r["id"]: r["name"] for r in relevant}
         session.relevant_collection_ids = list(col_ids)
+
+        # Build file-level query targets (OWUI stores embeddings per-file)
+        dr_file_ids_map = {}
+        for r in relevant:
+            fids = r.get("data", {}).get("file_ids", [])
+            if fids:
+                dr_file_ids_map[r["id"]] = fids
+
         await _emit(__event_emitter__, f"📚 {len(relevant)}/{len(all_cols)} collection(s) relevant")
 
         has_existing = bool(col_ids)
@@ -2069,7 +2226,7 @@ class Tools:
             await _emit(__event_emitter__, "🔍 Phase 1: Querying existing knowledge...")
             for n in range(1, self.valves.max_iterations + 1):
                 await _emit(__event_emitter__, f"🔍 KR iter {n}: querying {len(col_ids)} collection(s)...")
-                it = await rag.run_iteration(session, terms, col_ids, col_map, n, __request__, __user__ or {})
+                it = await rag.run_iteration(session, terms, col_ids, col_map, n, __request__, __user__ or {}, file_ids_map=dr_file_ids_map)
                 j.write_iteration(session, it)
 
                 if it.new_chunks == 0:
@@ -2149,8 +2306,15 @@ class Tools:
             await _emit(__event_emitter__, f"✅ Crawled {ok}/{len(targets)} domain(s)")
 
             # Refresh collections
-            all_cols = await rag.list_collections()
+            all_cols, _ = await rag.list_collections(__request__)
             col_map = {c["id"]: c["name"] for c in all_cols}
+
+            # Refresh file_ids_map with newly crawled collections
+            dr_file_ids_map = {}
+            for c in all_cols:
+                fids = c.get("data", {}).get("file_ids", [])
+                if fids:
+                    dr_file_ids_map[c["id"]] = fids
             for cr in session.crawl_results:
                 if cr.success:
                     for c in all_cols:
@@ -2175,7 +2339,7 @@ class Tools:
 
             for n in range(start, start + self.valves.max_iterations):
                 await _emit(__event_emitter__, f"🔍 KR iter {n}: querying {len(all_ids)} collection(s)...")
-                it = await rag.run_iteration(session, p2_terms, all_ids, col_map, n, __request__, __user__ or {})
+                it = await rag.run_iteration(session, p2_terms, all_ids, col_map, n, __request__, __user__ or {}, file_ids_map=dr_file_ids_map)
                 j.write_iteration(session, it)
 
                 if it.new_chunks == 0:
