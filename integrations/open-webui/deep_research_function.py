@@ -299,8 +299,9 @@ async def _extract_anchor(sa: '_SubAgent', query: str, request, user: Dict) -> t
 
 
 class _SubAgent:
-    def __init__(self, model_id: str):
+    def __init__(self, model_id: str, max_prompt_tokens: int = 6000):
         self._model_id = model_id
+        self._max_prompt_chars = max_prompt_tokens * 4
 
     async def run(self, system_prompt: str, user_prompt: str, request, user: Dict,
                   json_mode: bool = False) -> str:
@@ -318,6 +319,24 @@ class _SubAgent:
             f"INSTRUCTIONS (follow these exactly):\n{system_prompt}\n\n"
             f"---\nINPUT:\n{user_prompt}"
         )
+
+        # Truncate if prompt exceeds budget
+        total_chars = len(sys_msg) + len(combined)
+        if total_chars > self._max_prompt_chars:
+            budget = self._max_prompt_chars - len(sys_msg) - 100
+            if budget > len(system_prompt) + 200:
+                combined = combined[:budget] + (
+                    "\n\n[... content truncated to fit context window ...]"
+                )
+            else:
+                combined = combined[:max(budget, 500)] + (
+                    "\n\n[... content truncated to fit context window ...]"
+                )
+            logger.info(
+                "Truncated prompt from %d to %d chars (budget: %d tokens)",
+                total_chars, len(sys_msg) + len(combined),
+                self._max_prompt_chars // 4,
+            )
 
         form_data = {
             "model": self._model_id,
@@ -766,7 +785,8 @@ class _RagResearcher:
 
         summary, concepts = "", []
         if new_chunks:
-            ctx = "\n\n---\n\n".join(f"**[{c.collection_name}]** ({c.source})\n{c.content}" for c in new_chunks[:20])
+            max_ch = getattr(self._valves, 'max_chunks_per_iteration', 10)
+            ctx = "\n\n---\n\n".join(f"**[{c.collection_name}]** ({c.source})\n{c.content}" for c in new_chunks[:max_ch])
             try:
                 r = await self._sa.run_json(_EXPANSION_PROMPT,
                     f"{session.anchor}\n\nSearch terms used: {', '.join(terms)}\n\nRetrieved ({len(new_chunks)} new chunks):\n\n{ctx}",
@@ -817,39 +837,35 @@ class _RagResearcher:
 # =============================================================================
 
 _SYNTHESIS_PROMPT = """\
-You are a **source-grounded** research synthesizer. You may ONLY make claims \
-that are directly supported by the provided evidence. You are NOT a general \
-knowledge assistant — treat this as a courtroom: no evidence, no claim.
+You are a source-grounded research synthesizer. Only make claims supported \
+by the provided evidence.
 
-## Hard Rules
-1. **Source-grounded claims only.** Every factual statement must trace to a \
-specific Collected Source by number (e.g. [Source 3]). If no source supports \
-a claim, do NOT make it — instead note it as a gap.
-2. **ZERO fabricated URLs.** The Sources section must contain ONLY URLs copied \
-verbatim from the Collected Sources list. A synthesis with fabricated URLs is \
-a failed synthesis.
-3. **No gap-filling from training data.** If the collected evidence is \
-insufficient to answer part of the query, say so explicitly in the Gaps \
-section. Do NOT fill in missing information from your general knowledge.
-4. **No generic templates.** Your answer must be specific to the actual \
-evidence collected. If sources only cover surface-level information, \
-produce a surface-level answer and flag the depth gap.
-5. **Verify terminology.** If sources use a specific term for a technology, \
-framework, or concept, use that exact term. Do NOT substitute similar-sounding \
-technologies.
-6. **Confidence tagging.** Mark each major claim: \
-[SOURCED] — directly stated in a source, \
-[INFERRED] — reasonable inference from multiple sources, \
-[UNCERTAIN] — mentioned but not well-supported.
-7. **Scope fidelity.** Answer ONLY what the Research Anchor asks. Match the \
-requested format and depth.
+## Rules
+1. Every factual claim must reference a Collected Source by number [Source N]. \
+No evidence = no claim — note it as a gap instead.
+2. ZERO fabricated URLs. Only use URLs from the Collected Sources list verbatim.
+3. Do not fill gaps from training data. State gaps explicitly.
+4. Tag claims: [SOURCED] (directly stated), [INFERRED] (reasonable inference), \
+[UNCERTAIN] (poorly supported). Never include [FABRICATED] claims.
+5. Answer ONLY what the Research Anchor asks. Match requested format/depth.
 
-Structure:
-### Reasoning  (step-by-step, reference sources by number)
-### Answer     (comprehensive, every claim tagged)
-### Confidence Assessment  (evidence quality, source diversity, notable gaps)
-### Sources    (ONLY URLs from Collected Sources list)
-### Gaps & Limitations  (what evidence does NOT cover)\
+## Output Structure
+
+### Reasoning
+Step-by-step analysis referencing specific sources by number.
+
+### Answer
+Evidence-grounded answer with confidence tags on each factual claim.
+
+### Confidence Assessment
+- Evidence quality: strong/moderate/thin/insufficient
+- Source diversity and notable gaps
+
+### Sources
+ONLY URLs from Collected Sources. Format: 1. [Source N] Title — URL
+
+### Gaps & Limitations
+Uncovered aspects, conflicts, recommended follow-ups.\
 """
 
 _VERIFICATION_PROMPT = """\
@@ -959,33 +975,42 @@ class _Synthesizer:
             else:
                 await _emit(event_emitter, "✅ All URLs verified against sources")
 
-            # Post-synthesis: LLM verification pass
-            await _emit(event_emitter, "🔍 Running credibility verification (checking claims, terminology, scope)...")
-            verification = await self._verify(answer, all_sources, session, request, user)
-            issues = verification.get("issues", [])
-            critical_issues = [i for i in issues if isinstance(i, dict) and i.get("severity") == "critical"]
-            warning_issues = [i for i in issues if isinstance(i, dict) and i.get("severity") == "warning"]
-
-            # Derive credibility from issues when LLM returns unknown/missing
-            credibility = verification.get("overall_credibility", "unknown")
-            if credibility in ("unknown", "", None):
-                credibility = self._derive_credibility(len(critical_issues), len(warning_issues), len(all_sources))
-                verification["overall_credibility"] = credibility
-
-            if critical_issues:
-                await _emit(event_emitter, f"🔴 Verification: {len(critical_issues)} critical issue(s), credibility={credibility}")
-                for ci in critical_issues:
-                    detail = ci.get("detail", ci.get("type", "unknown issue"))
-                    await _emit(event_emitter, f"   ⚠️ {detail[:200]}")
-            elif warning_issues:
-                await _emit(event_emitter, f"🟡 Verification: {len(warning_issues)} warning(s), credibility={credibility}")
-                for wi in warning_issues:
-                    detail = wi.get("detail", wi.get("type", "unknown"))
-                    await _emit(event_emitter, f"   🟡 {detail[:200]}")
-            elif credibility in ("unknown", "very_low"):
-                await _emit(event_emitter, f"⚪ Verification inconclusive — credibility={credibility}")
+            # Post-synthesis: LLM verification pass (skippable for small models)
+            if self._valves.skip_verification:
+                logger.info("Skipping LLM verification (skip_verification=True)")
+                await _emit(event_emitter, "⏭️ Verification skipped (small model mode)")
+                verification = {"issues": [], "overall_credibility": "unverified", "recommendation": "pass"}
+                issues = []
+                critical_issues = []
+                warning_issues = []
+                credibility = "unverified"
             else:
-                await _emit(event_emitter, f"✅ Verification passed — credibility={credibility}")
+                await _emit(event_emitter, "🔍 Running credibility verification (checking claims, terminology, scope)...")
+                verification = await self._verify(answer, all_sources, session, request, user)
+                issues = verification.get("issues", [])
+                critical_issues = [i for i in issues if isinstance(i, dict) and i.get("severity") == "critical"]
+                warning_issues = [i for i in issues if isinstance(i, dict) and i.get("severity") == "warning"]
+
+                # Derive credibility from issues when LLM returns unknown/missing
+                credibility = verification.get("overall_credibility", "unknown")
+                if credibility in ("unknown", "", None):
+                    credibility = self._derive_credibility(len(critical_issues), len(warning_issues), len(all_sources))
+                    verification["overall_credibility"] = credibility
+
+                if critical_issues:
+                    await _emit(event_emitter, f"🔴 Verification: {len(critical_issues)} critical issue(s), credibility={credibility}")
+                    for ci in critical_issues:
+                        detail = ci.get("detail", ci.get("type", "unknown issue"))
+                        await _emit(event_emitter, f"   ⚠️ {detail[:200]}")
+                elif warning_issues:
+                    await _emit(event_emitter, f"🟡 Verification: {len(warning_issues)} warning(s), credibility={credibility}")
+                    for wi in warning_issues:
+                        detail = wi.get("detail", wi.get("type", "unknown"))
+                        await _emit(event_emitter, f"   🟡 {detail[:200]}")
+                elif credibility in ("unknown", "very_low"):
+                    await _emit(event_emitter, f"⚪ Verification inconclusive — credibility={credibility}")
+                else:
+                    await _emit(event_emitter, f"✅ Verification passed — credibility={credibility}")
 
             # Write verification results to journal
             self._write_verification_journal(session, verification, scrubbed, all_sources)
@@ -2127,15 +2152,18 @@ class Tools:
         smolcrawl_api_key: str = Field(default="0p3n-w3bu!", description="Pipelines server API key")
         owui_base_url: str = Field(default="http://openwebui:8080", description="Open WebUI API base URL")
         owui_api_key: str = Field(default="", description="Bearer token for OWUI API")
-        max_iterations: int = Field(default=5, ge=1, le=15, description="Hard cap on research iterations")
-        fixed_iterations: int = Field(default=2, ge=1, le=5, description="Guaranteed iterations before continue-decision")
-        min_relevant_sources: int = Field(default=5, ge=1, le=30, description="Target: stop researching once this many anchor-relevant sources are found")
-        max_web_results: int = Field(default=10, ge=1, le=50, description="Max web search results per query")
+        max_iterations: int = Field(default=3, ge=1, le=15, description="Hard cap on research iterations")
+        fixed_iterations: int = Field(default=1, ge=1, le=5, description="Guaranteed iterations before continue-decision")
+        min_relevant_sources: int = Field(default=3, ge=1, le=30, description="Target: stop researching once this many anchor-relevant sources are found")
+        max_web_results: int = Field(default=5, ge=1, le=50, description="Max web search results per query")
         include_sources: bool = Field(default=True, description="Append source references to answer")
-        top_k_per_collection: int = Field(default=5, ge=1, le=20, description="Chunks per collection per query")
-        max_collections: int = Field(default=10, ge=1, le=50, description="Max collections to search")
-        max_domains: int = Field(default=5, ge=1, le=20, description="Max domains to discover")
+        top_k_per_collection: int = Field(default=3, ge=1, le=20, description="Chunks per collection per query")
+        max_collections: int = Field(default=5, ge=1, le=50, description="Max collections to search")
+        max_domains: int = Field(default=3, ge=1, le=20, description="Max domains to discover")
         auto_approve_domains: bool = Field(default=True, description="Auto-approve all non-covered domains (skip manual approval)")
+        max_prompt_tokens: int = Field(default=6000, ge=1000, le=32000, description="Approximate token budget for SubAgent prompts (chars/4). Prompts exceeding this are truncated.")
+        max_chunks_per_iteration: int = Field(default=10, ge=1, le=50, description="Max RAG chunks included in LLM summarization per iteration")
+        skip_verification: bool = Field(default=False, description="Skip LLM verification/remediation passes (saves 2 LLM calls, faster for small models)")
         fileshed_compatible: bool = Field(default=True, description="Write journal to Fileshed Storage zone")
         storage_base_path: str = Field(default="/app/backend/data/user_files", description="Fileshed storage base path")
         save_journal: bool = Field(default=True, description="Persist research journal to disk")
@@ -2157,7 +2185,7 @@ class Tools:
             query: The research question or topic to explore.
         """
         mid = _SubAgent.resolve_model_id(__metadata__, __model__)
-        sa = _SubAgent(mid)
+        sa = _SubAgent(mid, self.valves.max_prompt_tokens)
         j = _Journal(self.valves)
         syn = _Synthesizer(self.valves, sa, j)
         return await _QuickResearcher(self.valves, sa, j, syn).run(
@@ -2186,7 +2214,7 @@ class Tools:
                 this collection exclusively.
         """
         mid = _SubAgent.resolve_model_id(__metadata__, __model__)
-        sa = _SubAgent(mid)
+        sa = _SubAgent(mid, self.valves.max_prompt_tokens)
         j = _Journal(self.valves)
         syn = _Synthesizer(self.valves, sa, j)
         return await _KnowledgeResearcher(self.valves, sa, j, syn).run(
@@ -2213,7 +2241,7 @@ class Tools:
             query: The research question or topic to investigate.
         """
         mid = _SubAgent.resolve_model_id(__metadata__, __model__)
-        sa = _SubAgent(mid)
+        sa = _SubAgent(mid, self.valves.max_prompt_tokens)
         j = _Journal(self.valves)
         rag = _RagResearcher(self.valves, sa)
         crawl = _CrawlClient(self.valves)

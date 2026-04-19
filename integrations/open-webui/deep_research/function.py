@@ -74,7 +74,7 @@ class Tools:
         model_id = SubAgent.resolve_model_id(__metadata__, __model__)
         user_id = (__user__ or {}).get("id", "")
 
-        sub_agent = SubAgent(model_id)
+        sub_agent = SubAgent(model_id, self.valves.max_prompt_tokens)
         journal = ResearchJournal(self.valves)
         researcher = QuickResearcher(self.valves, sub_agent, journal)
 
@@ -119,7 +119,7 @@ class Tools:
         model_id = SubAgent.resolve_model_id(__metadata__, __model__)
         user_id = (__user__ or {}).get("id", "")
 
-        sub_agent = SubAgent(model_id)
+        sub_agent = SubAgent(model_id, self.valves.max_prompt_tokens)
         journal = ResearchJournal(self.valves)
         researcher = KnowledgeResearcher(self.valves, sub_agent, journal)
 
@@ -161,7 +161,7 @@ class Tools:
         model_id = SubAgent.resolve_model_id(__metadata__, __model__)
         user_id = (__user__ or {}).get("id", "")
 
-        sub_agent = SubAgent(model_id)
+        sub_agent = SubAgent(model_id, self.valves.max_prompt_tokens)
         journal = ResearchJournal(self.valves)
         rag = RagResearcher(self.valves, sub_agent)
         crawl_client = CrawlClient(self.valves)

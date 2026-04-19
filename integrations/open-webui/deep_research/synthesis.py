@@ -17,63 +17,35 @@ from .sub_agent import SubAgent
 logger = logging.getLogger("deep_research.synthesis")
 
 _SYNTHESIS_SYSTEM_PROMPT = """\
-You are a **source-grounded** research synthesizer. You may ONLY make claims \
-that are directly supported by the provided evidence. You are NOT a general \
-knowledge assistant — treat this as a courtroom: no evidence, no claim.
+You are a source-grounded research synthesizer. Only make claims supported \
+by the provided evidence.
 
-## Hard Rules
-
-1. **Source-grounded claims only.** Every factual statement must trace to a \
-specific Collected Source by number (e.g. [Source 3]). If no source supports \
-a claim, do NOT make it — instead note it as a gap.
-2. **ZERO fabricated URLs.** The Sources section must contain ONLY URLs copied \
-verbatim from the Collected Sources list. If you cannot find a URL in that \
-list, do not invent one. A synthesis with fabricated URLs is a failed synthesis.
-3. **No gap-filling from training data.** If the collected evidence is \
-insufficient to answer part of the query, say so explicitly in the Gaps \
-section. Do NOT fill in missing information from your general knowledge — \
-this creates dangerous false confidence.
-4. **No generic templates.** Your answer must be specific to the actual \
-evidence collected. If sources only cover surface-level information, \
-produce a surface-level answer and flag the depth gap — do not generate \
-a detailed how-to guide from imagination.
-5. **Verify terminology.** If sources use a specific term for a technology, \
-framework, or concept, use that exact term. Do NOT substitute similar-sounding \
-technologies (e.g., do not confuse a server framework with a UI framework, \
-or a backend tool with a frontend tool).
-6. **Confidence tagging.** Mark each major claim with confidence:
-   - [SOURCED] — directly stated in a collected source
-   - [INFERRED] — reasonable inference from multiple sources
-   - [UNCERTAIN] — mentioned but not well-supported
-   Do NOT include claims that would need a [FABRICATED] tag.
-7. **Scope fidelity.** Answer ONLY what the Research Anchor asks. If the \
-anchor asks for a risk analysis, produce a risk analysis, not a how-to guide. \
-Match the requested format and depth.
+## Rules
+1. Every factual claim must reference a Collected Source by number [Source N]. \
+No evidence = no claim — note it as a gap instead.
+2. ZERO fabricated URLs. Only use URLs from the Collected Sources list verbatim.
+3. Do not fill gaps from training data. State gaps explicitly.
+4. Tag claims: [SOURCED] (directly stated), [INFERRED] (reasonable inference), \
+[UNCERTAIN] (poorly supported). Never include [FABRICATED] claims.
+5. Answer ONLY what the Research Anchor asks. Match requested format/depth.
 
 ## Output Structure
 
 ### Reasoning
-Step-by-step analysis of what the evidence actually shows. Reference \
-specific sources by number. Note contradictions between sources.
+Step-by-step analysis referencing specific sources by number.
 
 ### Answer
-Comprehensive answer grounded in evidence. Every factual claim tagged \
-with [SOURCED], [INFERRED], or [UNCERTAIN]. If the evidence is thin, \
-the answer should be proportionally brief.
+Evidence-grounded answer with confidence tags on each factual claim.
 
 ### Confidence Assessment
-- Evidence quality: (strong / moderate / thin / insufficient)
-- Source diversity: (how many independent sources support key claims)
-- Notable gaps: (what the evidence does NOT cover)
+- Evidence quality: strong/moderate/thin/insufficient
+- Source diversity and notable gaps
 
 ### Sources
-ONLY URLs from the Collected Sources list. Format:
-1. [Source N] Title — URL
+ONLY URLs from Collected Sources. Format: 1. [Source N] Title — URL
 
 ### Gaps & Limitations
-- Specific aspects of the query not covered by evidence
-- Areas where sources conflict or are ambiguous
-- Recommended follow-up searches\
+Uncovered aspects, conflicts, recommended follow-ups.\
 """
 
 _VERIFICATION_SYSTEM_PROMPT = """\
@@ -224,66 +196,79 @@ class Synthesizer:
             else:
                 await self._emit(event_emitter, "✅ All URLs verified against sources")
 
-            # Step 2: LLM-based verification pass
-            await self._emit(
-                event_emitter,
-                "🔍 Running credibility verification (checking claims, terminology, scope)...",
-            )
-            verification = await self._verify_synthesis(
-                answer, all_sources, session, request, user
-            )
-            issues = verification.get("issues", [])
-            critical_issues = [
-                i for i in issues
-                if isinstance(i, dict) and i.get("severity") == "critical"
-            ]
-            warning_issues = [
-                i for i in issues
-                if isinstance(i, dict) and i.get("severity") == "warning"
-            ]
-
-            # Derive credibility from issues when LLM returns unknown/missing
-            credibility = verification.get("overall_credibility", "unknown")
-            if credibility in ("unknown", "", None):
-                credibility = self._derive_credibility(
-                    len(critical_issues), len(warning_issues), len(all_sources)
-                )
-                verification["overall_credibility"] = credibility
-
-            if critical_issues:
-                await self._emit(
-                    event_emitter,
-                    f"🔴 Verification: {len(critical_issues)} critical issue(s), "
-                    f"credibility={credibility}",
-                )
-                for ci in critical_issues:
-                    detail = ci.get("detail", ci.get("type", "unknown issue"))
-                    await self._emit(
-                        event_emitter,
-                        f"   ⚠️ {detail[:200]}",
-                    )
-            elif warning_issues:
-                await self._emit(
-                    event_emitter,
-                    f"🟡 Verification: {len(warning_issues)} warning(s), "
-                    f"credibility={credibility}",
-                )
-                for wi in warning_issues:
-                    detail = wi.get("detail", wi.get("type", "unknown"))
-                    await self._emit(
-                        event_emitter,
-                        f"   🟡 {detail[:200]}",
-                    )
-            elif credibility in ("unknown", "very_low"):
-                await self._emit(
-                    event_emitter,
-                    f"⚪ Verification inconclusive — credibility={credibility}",
-                )
+            # Step 2: LLM-based verification pass (skippable for small models)
+            if self._valves.skip_verification:
+                logger.info("Skipping LLM verification (skip_verification=True)")
+                await self._emit(event_emitter, "⏭️ Verification skipped (small model mode)")
+                verification = {
+                    "issues": [],
+                    "overall_credibility": "unverified",
+                    "recommendation": "pass",
+                }
+                issues = []
+                critical_issues = []
+                warning_issues = []
+                credibility = "unverified"
             else:
                 await self._emit(
                     event_emitter,
-                    f"✅ Verification passed — credibility={credibility}",
+                    "🔍 Running credibility verification (checking claims, terminology, scope)...",
                 )
+                verification = await self._verify_synthesis(
+                    answer, all_sources, session, request, user
+                )
+                issues = verification.get("issues", [])
+                critical_issues = [
+                    i for i in issues
+                    if isinstance(i, dict) and i.get("severity") == "critical"
+                ]
+                warning_issues = [
+                    i for i in issues
+                    if isinstance(i, dict) and i.get("severity") == "warning"
+                ]
+
+                # Derive credibility from issues when LLM returns unknown/missing
+                credibility = verification.get("overall_credibility", "unknown")
+                if credibility in ("unknown", "", None):
+                    credibility = self._derive_credibility(
+                        len(critical_issues), len(warning_issues), len(all_sources)
+                    )
+                    verification["overall_credibility"] = credibility
+
+                if critical_issues:
+                    await self._emit(
+                        event_emitter,
+                        f"🔴 Verification: {len(critical_issues)} critical issue(s), "
+                        f"credibility={credibility}",
+                    )
+                    for ci in critical_issues:
+                        detail = ci.get("detail", ci.get("type", "unknown issue"))
+                        await self._emit(
+                            event_emitter,
+                            f"   ⚠️ {detail[:200]}",
+                        )
+                elif warning_issues:
+                    await self._emit(
+                        event_emitter,
+                        f"🟡 Verification: {len(warning_issues)} warning(s), "
+                        f"credibility={credibility}",
+                    )
+                    for wi in warning_issues:
+                        detail = wi.get("detail", wi.get("type", "unknown"))
+                        await self._emit(
+                            event_emitter,
+                            f"   🟡 {detail[:200]}",
+                        )
+                elif credibility in ("unknown", "very_low"):
+                    await self._emit(
+                        event_emitter,
+                        f"⚪ Verification inconclusive — credibility={credibility}",
+                    )
+                else:
+                    await self._emit(
+                        event_emitter,
+                        f"✅ Verification passed — credibility={credibility}",
+                    )
 
             # Write verification results to journal
             self._write_verification_journal(

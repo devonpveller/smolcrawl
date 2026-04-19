@@ -23,8 +23,9 @@ class SubAgent:
     Reuses the user's selected model for all sub-agent calls.
     """
 
-    def __init__(self, model_id: str):
+    def __init__(self, model_id: str, max_prompt_tokens: int = 6000):
         self._model_id = model_id
+        self._max_prompt_chars = max_prompt_tokens * 4  # rough char-to-token ratio
 
     async def run(
         self,
@@ -62,6 +63,26 @@ class SubAgent:
             f"INSTRUCTIONS (follow these exactly):\n{system_prompt}\n\n"
             f"---\nINPUT:\n{user_prompt}"
         )
+
+        # Truncate if prompt exceeds budget (preserves system instructions,
+        # truncates user content from the end)
+        total_chars = len(sys_msg) + len(combined)
+        if total_chars > self._max_prompt_chars:
+            budget = self._max_prompt_chars - len(sys_msg) - 100
+            if budget > len(system_prompt) + 200:
+                # Keep full instructions, truncate input
+                combined = combined[:budget] + (
+                    "\n\n[... content truncated to fit context window ...]"
+                )
+            else:
+                combined = combined[:max(budget, 500)] + (
+                    "\n\n[... content truncated to fit context window ...]"
+                )
+            logger.info(
+                "Truncated prompt from %d to %d chars (budget: %d tokens)",
+                total_chars, len(sys_msg) + len(combined),
+                self._max_prompt_chars // 4,
+            )
 
         form_data = {
             "model": self._model_id,

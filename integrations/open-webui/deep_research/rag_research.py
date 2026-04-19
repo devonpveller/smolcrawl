@@ -351,9 +351,10 @@ class RagResearcher:
                         new_chunks.append(chunk)
 
         # Build context for LLM summarization
+        max_chunks = getattr(self._valves, 'max_chunks_per_iteration', 10)
         chunk_text = "\n\n---\n\n".join(
             f"**[{c.collection_name}]** ({c.source})\n{c.content}"
-            for c in new_chunks[:20]  # Cap to avoid context overflow
+            for c in new_chunks[:max_chunks]
         )
 
         # Get LLM summary + new concepts

@@ -51,25 +51,25 @@ class Valves(BaseModel):
 
     # Research settings (shared by research + deep_research)
     max_iterations: int = Field(
-        default=5,
+        default=3,
         ge=1,
         le=15,
         description="Hard cap on research iterations",
     )
     fixed_iterations: int = Field(
-        default=2,
+        default=1,
         ge=1,
         le=5,
         description="Guaranteed iterations before continue-decision",
     )
     min_relevant_sources: int = Field(
-        default=5,
+        default=3,
         ge=1,
         le=30,
         description="Target: stop researching once this many anchor-relevant sources are found",
     )
     max_web_results: int = Field(
-        default=10,
+        default=5,
         ge=1,
         le=50,
         description="Max web search results per query",
@@ -81,19 +81,19 @@ class Valves(BaseModel):
 
     # Deep research specific
     top_k_per_collection: int = Field(
-        default=5,
+        default=3,
         ge=1,
         le=20,
         description="Chunks retrieved per collection per query",
     )
     max_collections: int = Field(
-        default=10,
+        default=5,
         ge=1,
         le=50,
         description="Max collections to search",
     )
     max_domains: int = Field(
-        default=5,
+        default=3,
         ge=1,
         le=20,
         description="Max domains to discover via web search",
@@ -101,6 +101,26 @@ class Valves(BaseModel):
     auto_approve_domains: bool = Field(
         default=True,
         description="Auto-approve all non-covered domains (skip manual approval)",
+    )
+
+    # Context management
+    max_prompt_tokens: int = Field(
+        default=6000,
+        ge=1000,
+        le=32000,
+        description="Approximate token budget for SubAgent prompts (chars/4). "
+                    "Prompts exceeding this are truncated. Set lower for small models.",
+    )
+    max_chunks_per_iteration: int = Field(
+        default=10,
+        ge=1,
+        le=50,
+        description="Max RAG chunks included in LLM summarization per iteration",
+    )
+    skip_verification: bool = Field(
+        default=False,
+        description="Skip LLM verification/remediation passes (saves 2 LLM calls, "
+                    "faster for small models)",
     )
 
     # Fileshed integration
