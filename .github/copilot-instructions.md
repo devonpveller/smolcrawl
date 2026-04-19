@@ -58,13 +58,13 @@ src/smolcrawl/                    # Core library (pip install -e .)
       └── llm_evaluator.py        #   LLM-based cross-domain link scoring
 
 integrations/open-webui/          # OWUI integration (deployed via Docker)
-  ├── deep_research_function.py   # Single-file OWUI Tool (~1800 lines, self-contained)
+  ├── deep_research_tool.py       # Single-file OWUI Tool (~1800 lines, self-contained)
   ├── smolcrawl_pipeline.py       # OWUI Pipeline: crawl → augment → upload to KB
   ├── docker-compose.yml          # SmolCrawl Pipelines container config
   ├── Dockerfile                  # Based on open-webui/pipelines, adds Node.js + smolcrawl
   └── deep_research/              # Modular version (same logic, split into modules)
       ├── models.py               #   Valves, ResearchPhase, dataclasses
-      ├── function.py             #   Tools entry point: research() + knowledge_research() + deep_research()
+      ├── tool.py                 #   Tools entry point: research() + knowledge_research() + deep_research()
       ├── sub_agent.py            #   SubAgent: internal LLM calls via generate_chat_completion
       ├── research.py             #   QuickResearcher: web-search-only iteration loop
       ├── knowledge_research.py   #   KnowledgeResearcher: RAG-only iteration across existing collections
@@ -82,7 +82,7 @@ smolcrawl-data/cache/crawl/       # diskcache HTTP response cache (auto-created)
 
 **Two versions of deep research exist and must be kept in sync:**
 
-- `deep_research_function.py` — single-file for direct OWUI deployment (copy-paste into admin panel)
+- `deep_research_tool.py` — single-file for direct OWUI deployment (copy-paste into admin panel)
 - `deep_research/` — modular package for development and testing
 
 ## Core Data Models
@@ -234,7 +234,7 @@ The Dockerfile extends `ghcr.io/open-webui/pipelines:main`, adds Node.js (for re
 - **Imports**: stdlib → third-party → local, separated by blank lines.
 - **Indexers follow pluggable pattern**: `TantivyIndexer`, `MarkdownFileIndexer`, `XmlFileIndexer` all implement `add_pages()`/`add_page()`.
 - **Config injection**: never hardcode values; use `ProcessingConfig`/`Valves` with defaults.
-- **Dual-file sync**: changes to `deep_research/` modules must be mirrored in `deep_research_function.py` and vice versa.
+- **Dual-file sync**: changes to `deep_research/` modules must be mirrored in `deep_research_tool.py` and vice versa.
 
 ## Essential Commands
 
