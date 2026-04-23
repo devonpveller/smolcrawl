@@ -13,6 +13,7 @@ import httpx
 
 from .models import IterationResult, RetrievedChunk, ResearchSession, Valves
 from .sub_agent import SubAgent
+from .context_budget import condense_iterations
 
 # Internal OWUI imports — available when Tool runs inside OWUI process.
 # Guarded by try/except for Pipeline deployments (separate container).
@@ -350,12 +351,27 @@ class RagResearcher:
                     if is_new:
                         new_chunks.append(chunk)
 
-        # Build context for LLM summarization
+        # Build context for LLM summarization — cap total chunk text
+        # to fit within the prompt budget alongside the anchor and overhead
+        from .context_budget import usable_budget_chars
         max_chunks = getattr(self._valves, 'max_chunks_per_iteration', 10)
-        chunk_text = "\n\n---\n\n".join(
-            f"**[{c.collection_name}]** ({c.source})\n{c.content}"
-            for c in new_chunks[:max_chunks]
-        )
+        chunk_budget = usable_budget_chars(
+            self._valves.max_prompt_tokens
+        ) - len(session.anchor) - 1000  # reserve for anchor + system prompt
+
+        chunk_parts = []
+        used = 0
+        for c in new_chunks[:max_chunks]:
+            part = f"**[{c.collection_name}]** ({c.source})\n{c.content}"
+            if used + len(part) > chunk_budget and chunk_parts:
+                chunk_parts.append(
+                    f"*[{len(new_chunks) - len(chunk_parts)} more chunk(s) "
+                    f"omitted — details in journal]*"
+                )
+                break
+            chunk_parts.append(part)
+            used += len(part)
+        chunk_text = "\n\n---\n\n".join(chunk_parts)
 
         # Get LLM summary + new concepts
         summary = ""
@@ -413,10 +429,7 @@ class RagResearcher:
         Returns:
             List of new search terms for the next iteration.
         """
-        iteration_summaries = "\n\n".join(
-            f"**Iteration {it.iteration_number}:** {it.summary}"
-            for it in session.iterations
-        )
+        iteration_context = condense_iterations(session.iterations)
 
         try:
             result = await self._sub_agent.run_json(
@@ -424,7 +437,7 @@ class RagResearcher:
                 user_prompt=(
                     f"{session.anchor}\n\n"
                     f"Previous search terms: {', '.join(current_terms)}\n\n"
-                    f"Findings so far:\n{iteration_summaries}\n\n"
+                    f"Findings so far:\n{iteration_context}\n\n"
                     f"Suggest new search terms that address uncovered aspects "
                     f"per the anchor above."
                 ),
@@ -452,19 +465,14 @@ class RagResearcher:
         Returns:
             True if the LLM recommends continuing.
         """
-        iteration_summaries = "\n\n".join(
-            f"**Iteration {it.iteration_number}** "
-            f"(terms: {', '.join(it.search_terms)}): {it.summary}\n"
-            f"New chunks: {it.new_chunks}, New concepts: {', '.join(it.new_concepts)}"
-            for it in session.iterations
-        )
+        iteration_context = condense_iterations(session.iterations)
 
         try:
             result = await self._sub_agent.run_json(
                 system_prompt=_CONTINUE_SYSTEM_PROMPT,
                 user_prompt=(
                     f"{session.anchor}\n\n"
-                    f"Iteration results:\n{iteration_summaries}"
+                    f"Iteration results:\n{iteration_context}"
                 ),
                 request=request,
                 user=user,

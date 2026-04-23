@@ -24,6 +24,7 @@ from .models import (
 from .rag_research import RagResearcher
 from .sub_agent import SubAgent, extract_anchor
 from .synthesis import Synthesizer
+from .context_budget import condense_iterations
 
 logger = logging.getLogger("deep_research.knowledge_research")
 
@@ -588,13 +589,7 @@ class KnowledgeResearcher:
         user: Dict,
     ) -> Dict:
         """Analyze what aspects are covered vs uncovered after RAG iterations."""
-        iteration_summaries = "\n\n".join(
-            f"**Iteration {it.iteration_number}** "
-            f"(terms: {', '.join(it.search_terms)}): {it.summary}\n"
-            f"New chunks: {it.new_chunks}, "
-            f"Concepts: {', '.join(it.new_concepts)}"
-            for it in session.iterations
-        )
+        iteration_context = condense_iterations(session.iterations)
 
         try:
             return await self._sub_agent.run_json(
@@ -603,7 +598,7 @@ class KnowledgeResearcher:
                     f"{session.anchor}\n\n"
                     f"Collections searched: "
                     f"{', '.join(session.relevant_collection_ids)}\n\n"
-                    f"Iteration results:\n{iteration_summaries}"
+                    f"Iteration results:\n{iteration_context}"
                 ),
                 request=request,
                 user=user,

@@ -65,7 +65,9 @@ class SubAgent:
         )
 
         # Truncate if prompt exceeds budget (preserves system instructions,
-        # truncates user content from the end)
+        # truncates user content from the end).  The budget is derived from
+        # max_prompt_tokens which should match the model's context window
+        # minus a reserve for the response (~4k tokens).
         total_chars = len(sys_msg) + len(combined)
         if total_chars > self._max_prompt_chars:
             budget = self._max_prompt_chars - len(sys_msg) - 100
@@ -78,9 +80,11 @@ class SubAgent:
                 combined = combined[:max(budget, 500)] + (
                     "\n\n[... content truncated to fit context window ...]"
                 )
-            logger.info(
-                "Truncated prompt from %d to %d chars (budget: %d tokens)",
+            logger.warning(
+                "Truncated prompt: %d→%d chars (~%d→%d tokens, budget %d tokens). "
+                "Increase max_prompt_tokens or reduce research scope.",
                 total_chars, len(sys_msg) + len(combined),
+                total_chars // 4, (len(sys_msg) + len(combined)) // 4,
                 self._max_prompt_chars // 4,
             )
 

@@ -15,6 +15,7 @@ from .journal import ResearchJournal
 from .models import IterationResult, ResearchPhase, ResearchSession, Valves
 from .sub_agent import SubAgent, extract_anchor
 from .synthesis import Synthesizer
+from .context_budget import condense_iterations, usable_budget_chars
 
 logger = logging.getLogger("deep_research.research")
 
@@ -488,10 +489,7 @@ class QuickResearcher:
         user: Dict,
     ) -> List[str]:
         tried_str = ", ".join(sorted(tried_terms)[:20])
-        iters = "\n".join(
-            f"- Iter {i.iteration_number}: {i.summary[:150]}"
-            for i in session.iterations
-        )
+        iters = condense_iterations(session.iterations)
         try:
             r = await self._sub_agent.run_json(
                 system_prompt=_PIVOT_PROMPT,
@@ -568,13 +566,24 @@ class QuickResearcher:
                 "new_terms": [],
                 "covered_aspects": [],
             }
+        # Cap source text to fit context budget
+        budget = usable_budget_chars(self._valves.max_prompt_tokens)
+        anchor_overhead = len(session.anchor) + 500
+        source_budget = budget - anchor_overhead
+        capped_texts = []
+        used = 0
+        for t in texts:
+            if used + len(t) > source_budget and capped_texts:
+                break
+            capped_texts.append(t)
+            used += len(t)
         try:
             return await self._sub_agent.run_json(
                 system_prompt=_ANALYSIS_SYSTEM_PROMPT,
                 user_prompt=(
                     f"{session.anchor}\n\n"
-                    f"Sources ({len(texts)}):\n\n"
-                    + "\n\n---\n\n".join(texts[:15])
+                    f"Sources ({len(capped_texts)}/{len(texts)}):\n\n"
+                    + "\n\n---\n\n".join(capped_texts)
                 ),
                 request=request,
                 user=user,

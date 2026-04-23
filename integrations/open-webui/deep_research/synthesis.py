@@ -13,6 +13,11 @@ from urllib.parse import urlparse
 from .journal import ResearchJournal
 from .models import ResearchSession, Valves
 from .sub_agent import SubAgent
+from .context_budget import (
+    build_iteration_text,
+    cap_sources_to_budget,
+    usable_budget_chars,
+)
 
 logger = logging.getLogger("deep_research.synthesis")
 
@@ -160,13 +165,14 @@ class Synthesizer:
         all_sources = (relevant_sources or []) + (trail_sources or [])
         known_urls, known_domains = self._extract_known_urls(all_sources)
 
-        # Compose the synthesis prompt
+        # Compose the synthesis prompt (budget-aware)
         user_prompt = self._build_synthesis_prompt(
             session=session,
             prompt_content=prompt_content,
             iteration_summaries=iteration_summaries,
             relevant_sources=relevant_sources or [],
             trail_sources=trail_sources or [],
+            max_prompt_tokens=self._valves.max_prompt_tokens,
         )
 
         try:
@@ -317,59 +323,49 @@ class Synthesizer:
         iteration_summaries: List[str],
         relevant_sources: List[Dict] = None,
         trail_sources: List[Dict] = None,
+        max_prompt_tokens: int = 28000,
     ) -> str:
-        """Construct the user prompt for synthesis.
+        """Construct a budget-aware synthesis prompt.
+
+        Allocates the token budget across sections by priority so that
+        critical content (anchor, instructions, sources) is always
+        included, while lower-priority content (old iterations, session
+        context) is trimmed or omitted when the budget is tight.
+
+        Priority order:
+            1. Anchor + query + synthesis instructions (always included)
+            2. Collected sources (highest authority first, capped to budget)
+            3. Recent iteration summaries (most recent first)
+            4. Session context (lowest priority)
+
+        Full details remain available in the Fileshed journal.
 
         Args:
             session: The research session (for query and anchor).
             prompt_content: Content of 00-prompt.md.
             iteration_summaries: Content of each iteration file.
-            relevant_sources: List of relevant source dicts with url/title/summary/domain.
-            trail_sources: List of trail source dicts with url/title/summary/domain.
+            relevant_sources: Relevant source dicts.
+            trail_sources: Trail source dicts.
+            max_prompt_tokens: Token budget for this prompt.
 
         Returns:
-            Formatted prompt string.
+            Formatted prompt string within budget.
         """
-        parts = []
+        budget_chars = usable_budget_chars(max_prompt_tokens)
+
+        # --- Priority 1: Anchor + query (always included) ---
+        header_parts = []
         if session.anchor:
-            parts.append(f"# Research Anchor\n\n{session.anchor}\n")
-        parts.append(f"# Original Research Query\n\n{session.query}\n")
+            header_parts.append(f"# Research Anchor\n\n{session.anchor}\n")
+        header_parts.append(
+            f"# Original Research Query\n\n{session.query}\n"
+        )
+        header = "\n\n".join(header_parts)
 
-        if prompt_content:
-            parts.append(f"# Session Context\n\n{prompt_content}\n")
-
-        for i, summary in enumerate(iteration_summaries, 1):
-            parts.append(f"# Iteration {i} Findings\n\n{summary}\n")
-
-        # Include the actual source data so the LLM can cite real URLs
+        # --- Priority 1: Synthesis instructions (always included) ---
         all_sources = (relevant_sources or []) + (trail_sources or [])
-        if all_sources:
-            parts.append("# Collected Sources (EXHAUSTIVE LIST)\n")
-            parts.append(
-                "These are the ONLY sources found during research. "
-                "Your answer must be built EXCLUSIVELY from this evidence. "
-                "Reference sources by number [Source N]. "
-                "The Sources section of your answer must ONLY contain URLs "
-                "from this list — copied exactly, character for character.\n"
-            )
-            for i, s in enumerate(all_sources, 1):
-                parts.append(
-                    f"[Source {i}] **{s.get('title', 'Untitled')}**\n"
-                    f"   - URL: {s.get('url', 'N/A')}\n"
-                    f"   - Domain: {s.get('domain', '')}\n"
-                    f"   - Summary: {s.get('summary', '')}\n"
-                )
-        else:
-            parts.append(
-                "# Collected Sources\n\n"
-                "**NO sources were collected.** Your synthesis must state "
-                "that the research found no relevant sources and recommend "
-                "alternative approaches. Do NOT generate an answer from "
-                "general knowledge.\n"
-            )
-
         source_count = len(all_sources)
-        parts.append(
+        instructions = (
             "\n---\n\n"
             "## Synthesis Instructions\n\n"
             f"You have {source_count} source(s) to work with.\n"
@@ -383,7 +379,91 @@ class Synthesizer:
             "- Tag each factual claim: [SOURCED], [INFERRED], or [UNCERTAIN]."
         )
 
+        # Calculate remaining budget for variable-size sections
+        fixed_chars = len(header) + len(instructions) + 200  # separators
+        remaining = budget_chars - fixed_chars
+
+        if remaining < 1000:
+            # Extreme budget constraint — minimal prompt
+            return f"{header}\n\n{instructions}"
+
+        # Allocate remaining budget: 55% sources, 35% iterations, 10% context
+        source_budget = int(remaining * 0.55)
+        iteration_budget = int(remaining * 0.35)
+        context_budget = int(remaining * 0.10)
+
+        # --- Priority 2: Collected sources (capped by authority) ---
+        source_section = Synthesizer._build_source_section(
+            all_sources, source_budget
+        )
+
+        # --- Priority 3: Iteration summaries (most recent first) ---
+        iteration_section = build_iteration_text(
+            iteration_summaries, iteration_budget
+        )
+
+        # --- Priority 4: Session context (lowest priority) ---
+        context_section = ""
+        if prompt_content and context_budget > 200:
+            context_section = (
+                f"# Session Context\n\n{prompt_content[:context_budget]}\n"
+            )
+
+        # Assemble — instructions immediately after anchor so they survive
+        # any downstream truncation in SubAgent
+        parts = [header, instructions]
+        if context_section:
+            parts.append(context_section)
+        if iteration_section:
+            parts.append(iteration_section)
+        parts.append(source_section)
+
         return "\n\n".join(parts)
+
+    @staticmethod
+    def _build_source_section(
+        sources: List[Dict],
+        budget_chars: int,
+    ) -> str:
+        """Build the Collected Sources section within a character budget."""
+        if not sources:
+            return (
+                "# Collected Sources\n\n"
+                "**NO sources were collected.** Your synthesis must state "
+                "that the research found no relevant sources and recommend "
+                "alternative approaches. Do NOT generate an answer from "
+                "general knowledge.\n"
+            )
+
+        header = (
+            "# Collected Sources (EXHAUSTIVE LIST)\n\n"
+            "These are the ONLY sources found during research. "
+            "Your answer must be built EXCLUSIVELY from this evidence. "
+            "Reference sources by number [Source N]. "
+            "The Sources section of your answer must ONLY contain URLs "
+            "from this list \u2014 copied exactly, character for character.\n\n"
+        )
+
+        selected, omitted = cap_sources_to_budget(
+            sources, budget_chars - len(header) - 100
+        )
+
+        entries = []
+        for i, s in enumerate(selected, 1):
+            entries.append(
+                f"[Source {i}] **{s.get('title', 'Untitled')}**\n"
+                f"   - URL: {s.get('url', 'N/A')}\n"
+                f"   - Domain: {s.get('domain', '')}\n"
+                f"   - Summary: {s.get('summary', '')}\n"
+            )
+
+        if omitted > 0:
+            entries.append(
+                f"\n*[{omitted} additional source(s) omitted due to context "
+                f"limit \u2014 full list in journal]*\n"
+            )
+
+        return header + "\n".join(entries)
 
     @staticmethod
     def _build_fallback_synthesis(session: ResearchSession) -> str:

@@ -105,11 +105,13 @@ class Valves(BaseModel):
 
     # Context management
     max_prompt_tokens: int = Field(
-        default=6000,
+        default=28000,
         ge=1000,
-        le=32000,
-        description="Approximate token budget for SubAgent prompts (chars/4). "
-                    "Prompts exceeding this are truncated. Set lower for small models.",
+        le=128000,
+        description="Token budget for SubAgent prompts. Should be your model's "
+                    "context window minus ~4000 (response reserve). "
+                    "Default 28000 suits 32k models. Set lower for small models "
+                    "(e.g. 4000 for 8k context).",
     )
     max_chunks_per_iteration: int = Field(
         default=10,

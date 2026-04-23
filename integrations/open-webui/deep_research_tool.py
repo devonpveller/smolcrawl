@@ -298,6 +298,81 @@ async def _extract_anchor(sa: '_SubAgent', query: str, request, user: Dict) -> t
 # _WEB_SEARCH_LIST_PROMPT removed — we now call search_web() directly
 
 
+# --- Context budget management ---
+# Prevents context window overflow by condensing old iteration history
+# into compact summaries and capping source lists by authority.
+# Full details are always persisted to the journal.
+
+_CB_CHARS_PER_TOKEN = 4
+_CB_RESPONSE_RESERVE = 4000
+
+
+def _cb_usable_budget_chars(max_prompt_tokens: int) -> int:
+    """Character budget after reserving space for model response."""
+    return max(max_prompt_tokens - _CB_RESPONSE_RESERVE, 2000) * _CB_CHARS_PER_TOKEN
+
+
+def _cb_condense_iterations(iterations: list, recent_full: int = 2) -> str:
+    """Compress iteration history — recent in full, older condensed."""
+    if not iterations:
+        return "No iterations completed yet."
+    parts = []
+    cutoff = max(0, len(iterations) - recent_full)
+    if cutoff > 0:
+        total_new = sum(it.new_chunks for it in iterations[:cutoff])
+        total_found = sum(it.chunks_found for it in iterations[:cutoff])
+        all_concepts = []
+        for it in iterations[:cutoff]:
+            all_concepts.extend(it.new_concepts[:3])
+        unique_concepts = list(dict.fromkeys(all_concepts))[:10]
+        parts.append(f"**Prior iterations (1\u2013{cutoff}):** "
+                     f"{total_found} chunks retrieved, {total_new} new")
+        if unique_concepts:
+            parts.append(f"  Concepts: {', '.join(unique_concepts)}")
+        last_old = iterations[cutoff - 1]
+        if last_old.summary:
+            parts.append(f"  Last finding: {last_old.summary[:200]}")
+        parts.append("")
+    for it in iterations[cutoff:]:
+        parts.append(
+            f"**Iteration {it.iteration_number}** "
+            f"(terms: {', '.join(it.search_terms)}): {it.summary}\n"
+            f"New chunks: {it.new_chunks}, "
+            f"Concepts: {', '.join(it.new_concepts)}"
+        )
+    return "\n\n".join(parts)
+
+
+def _cb_cap_sources(sources: List[Dict], budget_chars: int) -> tuple:
+    """Select highest-authority sources within budget. Returns (selected, omitted_count)."""
+    sorted_src = sorted(sources, key=lambda s: s.get("authority", 0.5), reverse=True)
+    selected, used = [], 0
+    for s in sorted_src:
+        entry_len = (len(s.get("title", "")) + len(s.get("url", ""))
+                     + len(s.get("domain", "")) + len(s.get("summary", "")) + 80)
+        if used + entry_len > budget_chars and selected:
+            break
+        selected.append(s)
+        used += entry_len
+    return selected, len(sources) - len(selected)
+
+
+def _cb_build_iteration_text(summaries: List[str], budget_chars: int) -> str:
+    """Build iteration section for synthesis — most recent first, capped."""
+    if not summaries:
+        return ""
+    parts, used = [], 0
+    for i in range(len(summaries) - 1, -1, -1):
+        entry = f"# Iteration {i + 1} Findings\n\n{summaries[i]}\n"
+        if used + len(entry) > budget_chars and parts:
+            parts.append(f"*[{i + 1} earlier iteration(s) available in journal]*\n")
+            break
+        parts.append(entry)
+        used += len(entry)
+    parts.reverse()
+    return "\n\n".join(parts)
+
+
 class _SubAgent:
     def __init__(self, model_id: str, max_prompt_tokens: int = 6000):
         self._model_id = model_id
@@ -332,9 +407,11 @@ class _SubAgent:
                 combined = combined[:max(budget, 500)] + (
                     "\n\n[... content truncated to fit context window ...]"
                 )
-            logger.info(
-                "Truncated prompt from %d to %d chars (budget: %d tokens)",
+            logger.warning(
+                "Truncated prompt: %d\u2192%d chars (~%d\u2192%d tokens, budget %d tokens). "
+                "Increase max_prompt_tokens or reduce research scope.",
                 total_chars, len(sys_msg) + len(combined),
+                total_chars // 4, (len(sys_msg) + len(combined)) // 4,
                 self._max_prompt_chars // 4,
             )
 
@@ -786,7 +863,23 @@ class _RagResearcher:
         summary, concepts = "", []
         if new_chunks:
             max_ch = getattr(self._valves, 'max_chunks_per_iteration', 10)
-            ctx = "\n\n---\n\n".join(f"**[{c.collection_name}]** ({c.source})\n{c.content}" for c in new_chunks[:max_ch])
+            # Cap chunk text to fit within prompt budget
+            chunk_budget = _cb_usable_budget_chars(
+                self._valves.max_prompt_tokens
+            ) - len(session.anchor) - 1000
+            chunk_parts = []
+            used = 0
+            for c in new_chunks[:max_ch]:
+                part = f"**[{c.collection_name}]** ({c.source})\n{c.content}"
+                if used + len(part) > chunk_budget and chunk_parts:
+                    chunk_parts.append(
+                        f"*[{len(new_chunks) - len(chunk_parts)} more chunk(s) "
+                        f"omitted \u2014 details in journal]*"
+                    )
+                    break
+                chunk_parts.append(part)
+                used += len(part)
+            ctx = "\n\n---\n\n".join(chunk_parts)
             try:
                 r = await self._sa.run_json(_EXPANSION_PROMPT,
                     f"{session.anchor}\n\nSearch terms used: {', '.join(terms)}\n\nRetrieved ({len(new_chunks)} new chunks):\n\n{ctx}",
@@ -802,7 +895,7 @@ class _RagResearcher:
         return it
 
     async def expand_terms(self, session: ResearchSession, current: List[str], request, user: Dict) -> List[str]:
-        sums = "\n".join(f"Iteration {i.iteration_number}: {i.summary}" for i in session.iterations)
+        sums = _cb_condense_iterations(session.iterations)
         try:
             r = await self._sa.run_json(_EXPANSION_PROMPT,
                 f"{session.anchor}\n\nPrevious terms: {', '.join(current)}\nFindings:\n{sums}\n\nSuggest new search terms that address uncovered aspects per the anchor above.",
@@ -812,7 +905,7 @@ class _RagResearcher:
             return current
 
     async def should_continue(self, session: ResearchSession, request, user: Dict) -> bool:
-        sums = "\n".join(f"Iter {i.iteration_number}: new={i.new_chunks}, concepts={', '.join(i.new_concepts)}" for i in session.iterations)
+        sums = _cb_condense_iterations(session.iterations)
         try:
             r = await self._sa.run_json(_CONTINUE_PROMPT, f"{session.anchor}\n\n{sums}", request, user)
             return bool(r.get("continue", False))
@@ -924,37 +1017,17 @@ class _Synthesizer:
         all_sources = (relevant_sources or []) + (trail_sources or [])
         known_urls, known_domains = self._extract_known_urls(all_sources)
 
-        parts = [f"# Research Anchor\n\n{session.anchor}\n"]
-        parts.append(f"# Original Query\n\n{session.query}\n")
-        if prompt_md:
-            parts.append(f"# Context\n\n{prompt_md}\n")
-        for i, md in enumerate(iter_mds, 1):
-            parts.append(f"# Iteration {i}\n\n{md}\n")
+        # --- Budget-aware synthesis prompt construction ---
+        budget_chars = _cb_usable_budget_chars(self._v.max_prompt_tokens)
 
-        # Include the actual source data so the LLM can cite real URLs
-        if all_sources:
-            parts.append("# Collected Sources (EXHAUSTIVE LIST)\n")
-            parts.append("These are the ONLY sources found during research. "
-                         "Your answer must be built EXCLUSIVELY from this evidence. "
-                         "Reference sources by number [Source N]. "
-                         "The Sources section of your answer must ONLY contain URLs "
-                         "from this list — copied exactly, character for character.\n")
-            for i, s in enumerate(all_sources, 1):
-                parts.append(
-                    f"[Source {i}] **{s.get('title', 'Untitled')}**\n"
-                    f"   - URL: {s.get('url', 'N/A')}\n"
-                    f"   - Domain: {s.get('domain', '')}\n"
-                    f"   - Summary: {s.get('summary', '')}\n"
-                )
-        else:
-            parts.append("# Collected Sources\n\n"
-                         "**NO sources were collected.** Your synthesis must state "
-                         "that the research found no relevant sources. Do NOT "
-                         "generate an answer from general knowledge.\n")
+        # Priority 1: Anchor + query + instructions (always included)
+        header = f"# Research Anchor\n\n{session.anchor}\n"
+        header += f"\n\n# Original Query\n\n{session.query}\n"
 
         source_count = len(all_sources)
-        parts.append(
-            f"\n---\nYou have {source_count} source(s) to work with.\n"
+        instructions = (
+            "\n---\n\n## Synthesis Instructions\n\n"
+            f"You have {source_count} source(s) to work with.\n"
             "- Address EVERY item in the Research Anchor's 'must_cover' list.\n"
             "- For items NOT covered by any source, list them in Gaps.\n"
             "- In Sources, list ONLY URLs that appear verbatim in Collected Sources.\n"
@@ -962,6 +1035,61 @@ class _Synthesizer:
             "reflects what the evidence supports. Do NOT pad with general knowledge.\n"
             "- Tag each factual claim: [SOURCED], [INFERRED], or [UNCERTAIN]."
         )
+
+        fixed_chars = len(header) + len(instructions) + 200
+        remaining = budget_chars - fixed_chars
+
+        if remaining < 1000:
+            parts = [header, instructions]
+        else:
+            source_budget = int(remaining * 0.55)
+            iteration_budget = int(remaining * 0.35)
+            context_budget = int(remaining * 0.10)
+
+            # Priority 2: Sources (capped by authority)
+            if all_sources:
+                src_header = ("# Collected Sources (EXHAUSTIVE LIST)\n\n"
+                              "These are the ONLY sources found during research. "
+                              "Your answer must be built EXCLUSIVELY from this evidence. "
+                              "Reference sources by number [Source N]. "
+                              "The Sources section of your answer must ONLY contain URLs "
+                              "from this list \u2014 copied exactly, character for character.\n\n")
+                selected, omitted = _cb_cap_sources(all_sources, source_budget - len(src_header) - 100)
+                src_entries = []
+                for i, s in enumerate(selected, 1):
+                    src_entries.append(
+                        f"[Source {i}] **{s.get('title', 'Untitled')}**\n"
+                        f"   - URL: {s.get('url', 'N/A')}\n"
+                        f"   - Domain: {s.get('domain', '')}\n"
+                        f"   - Summary: {s.get('summary', '')}\n"
+                    )
+                if omitted > 0:
+                    src_entries.append(
+                        f"\n*[{omitted} additional source(s) omitted due to context "
+                        f"limit \u2014 full list in journal]*\n"
+                    )
+                source_section = src_header + "\n".join(src_entries)
+            else:
+                source_section = ("# Collected Sources\n\n"
+                                  "**NO sources were collected.** Your synthesis must state "
+                                  "that the research found no relevant sources. Do NOT "
+                                  "generate an answer from general knowledge.\n")
+
+            # Priority 3: Iteration summaries (most recent first, capped)
+            iteration_section = _cb_build_iteration_text(iter_mds, iteration_budget)
+
+            # Priority 4: Session context (lowest priority)
+            context_section = ""
+            if prompt_md and context_budget > 200:
+                context_section = f"# Context\n\n{prompt_md[:context_budget]}\n"
+
+            # Assemble \u2014 instructions right after anchor so they survive truncation
+            parts = [header, instructions]
+            if context_section:
+                parts.append(context_section)
+            if iteration_section:
+                parts.append(iteration_section)
+            parts.append(source_section)
 
         try:
             answer = await self._sa.run(_SYNTHESIS_PROMPT, "\n\n".join(parts), request, user)
@@ -976,7 +1104,7 @@ class _Synthesizer:
                 await _emit(event_emitter, "✅ All URLs verified against sources")
 
             # Post-synthesis: LLM verification pass (skippable for small models)
-            if self._valves.skip_verification:
+            if self._v.skip_verification:
                 logger.info("Skipping LLM verification (skip_verification=True)")
                 await _emit(event_emitter, "⏭️ Verification skipped (small model mode)")
                 verification = {"issues": [], "overall_credibility": "unverified", "recommendation": "pass"}
@@ -1633,7 +1761,7 @@ class _QuickResearcher:
 
     async def _pivot(self, session, tried_terms, request, user):
         tried_str = ", ".join(sorted(tried_terms)[:20])
-        iters = "\n".join(f"- Iter {i.iteration_number}: {i.summary[:150]}" for i in session.iterations)
+        iters = _cb_condense_iterations(session.iterations)
         try:
             r = await self._sa.run_json(_PIVOT_PROMPT,
                 f"{session.anchor}\n\nAlready tried: {tried_str}\nResults so far:\n{iters}",
@@ -1668,9 +1796,20 @@ class _QuickResearcher:
                         texts.append(f.read())
         if not texts:
             return {"summary": "No sources.", "gaps": ["entire query uncovered"], "new_terms": [], "covered_aspects": []}
+        # Cap source text to fit context budget
+        budget = _cb_usable_budget_chars(self._v.max_prompt_tokens)
+        anchor_overhead = len(session.anchor) + 500
+        source_budget = budget - anchor_overhead
+        capped = []
+        used = 0
+        for t in texts:
+            if used + len(t) > source_budget and capped:
+                break
+            capped.append(t)
+            used += len(t)
         try:
             return await self._sa.run_json(_ANALYSIS_PROMPT,
-                f"{session.anchor}\n\nSources ({len(texts)}):\n\n" + "\n\n---\n\n".join(texts[:15]), request, user)
+                f"{session.anchor}\n\nSources ({len(capped)}/{len(texts)}):\n\n" + "\n\n---\n\n".join(capped), request, user)
         except Exception:
             return {"summary": f"Found {len(texts)} sources.", "gaps": [], "new_terms": [], "covered_aspects": []}
 
@@ -1986,10 +2125,7 @@ class _KnowledgeResearcher:
     # --- Gap analysis ---
 
     async def _analyze_gaps(self, session, request, user):
-        sums = "\n\n".join(
-            f"**Iteration {it.iteration_number}** (terms: {', '.join(it.search_terms)}): "
-            f"{it.summary}\nNew chunks: {it.new_chunks}, Concepts: {', '.join(it.new_concepts)}"
-            for it in session.iterations)
+        sums = _cb_condense_iterations(session.iterations)
         try:
             return await self._sa.run_json(_KR_GAP_ANALYSIS_PROMPT,
                 f"{session.anchor}\n\nCollections: {', '.join(session.relevant_collection_ids)}\n\n"
@@ -2161,7 +2297,7 @@ class Tools:
         max_collections: int = Field(default=5, ge=1, le=50, description="Max collections to search")
         max_domains: int = Field(default=3, ge=1, le=20, description="Max domains to discover")
         auto_approve_domains: bool = Field(default=True, description="Auto-approve all non-covered domains (skip manual approval)")
-        max_prompt_tokens: int = Field(default=6000, ge=1000, le=32000, description="Approximate token budget for SubAgent prompts (chars/4). Prompts exceeding this are truncated.")
+        max_prompt_tokens: int = Field(default=28000, ge=1000, le=128000, description="Token budget for SubAgent prompts. Should be model context window minus ~4000. Default 28000 suits 32k models.")
         max_chunks_per_iteration: int = Field(default=10, ge=1, le=50, description="Max RAG chunks included in LLM summarization per iteration")
         skip_verification: bool = Field(default=False, description="Skip LLM verification/remediation passes (saves 2 LLM calls, faster for small models)")
         fileshed_compatible: bool = Field(default=True, description="Write journal to Fileshed Storage zone")
